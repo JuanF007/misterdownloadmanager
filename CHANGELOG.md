@@ -7,6 +7,7 @@ Each release's notes on GitHub come from its section here (`## [X.Y.Z]`, see
 
 ### Fixed
 
+- A link sent from the browser no longer fails with 403 on sites whose bot check refuses a browser's User-Agent on a connection that isn't a browser's: MDM asks once more with its own, as Add URL does ([#372](https://github.com/anefzaoui/misterdownloadmanager/issues/372)).
 - macOS: **Download video** no longer stops with a Python error and a "Python.framework is damaged" alert on a copy of MDM downloaded by a browser ([#330](https://github.com/anefzaoui/misterdownloadmanager/issues/330), [#339](https://github.com/anefzaoui/misterdownloadmanager/issues/339)). MDM now installs yt-dlp's folder build, which it unpacks once and checks against yt-dlp's signed list, instead of the single-program build that unpacks Python afresh at every start. The video window then offers to install it in place of a copy that came with an earlier version.
 - Browser link import: tighter handling of site data.
 - Crash reports: a freeze that was over before its snapshot was taken says so, instead of calling it a deadlock in code that was only waiting for events ([#355](https://github.com/anefzaoui/misterdownloadmanager/issues/355)).

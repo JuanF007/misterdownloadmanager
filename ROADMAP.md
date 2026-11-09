@@ -13,6 +13,8 @@ Everything below ships together, in version 0.5.0.
 
 ### Done
 
+- ✅ A link from the browser no longer ends in 403 where a site's bot check refuses the browser's
+  User-Agent: MDM asks once more as itself ([#372](https://github.com/anefzaoui/misterdownloadmanager/issues/372))
 - ✅ Freeze reports taken after the window has already answered say so, instead of blaming a deadlock
   (part of [#355](https://github.com/anefzaoui/misterdownloadmanager/issues/355))
 - ✅ **Move/Rename** works on several selected downloads at once: pick a folder and they all go there
