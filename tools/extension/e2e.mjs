@@ -324,7 +324,7 @@ async function chromium(bin, profile, dl, page, ready) {
         await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...at, buttons: 0, clickCount: 1 }, sessionId);
       }
     };
-    const KEYS = { ArrowDown: 40, Enter: 13 };
+    const KEYS = { ArrowDown: 40, ArrowUp: 38, Enter: 13 };
     const key = async (k) => {
       for (const type of ["keyDown", "keyUp"]) {
         // Enter carries its text, as a real key press does.
@@ -508,7 +508,7 @@ async function firefox(bin, profile, dl, page, ready) {
       await bidi.send("input.performActions", { context, actions: sources });
     };
     // WebDriver key codes.
-    const KEYS = { ArrowDown: "\uE015", Enter: "\uE007" };
+    const KEYS = { ArrowDown: "\uE015", ArrowUp: "\uE013", Enter: "\uE007" };
     const key = (k) =>
       bidi.send("input.performActions", {
         context,
@@ -1901,6 +1901,8 @@ const CASES = {
       const b = await hover(t.session, v);
       if (!b) throw new Error("no button over the stream's player");
       const before = new Set((await mdmList()).map((d) => d.id));
+      // What the page's own shortcuts would see (a player's Space and arrows).
+      await t.session.evaluate('window.__mdmKeys = 0; document.addEventListener("keydown", () => { window.__mdmKeys += 1; }); 0');
       await t.session.mouse(b.l + 14, (b.t + b.b) / 2, "click");
       // The menu, looking, then the qualities MDM found.
       let looked = false;
@@ -1913,6 +1915,11 @@ const CASES = {
       });
       if (!m.rows.some((r) => r.size)) throw new Error(`no row has a size: ${JSON.stringify(m.rows.map((r) => [r.name, r.size]))}`);
       if (!m.open.text) throw new Error("no \"Open in…\" under the qualities");
+      // The arrows move through the menu, and the page's shortcuts don't hear them.
+      await t.session.key("ArrowDown");
+      await t.session.key("ArrowUp");
+      const heard = await t.session.evaluate("window.__mdmKeys");
+      if (heard !== 0) throw new Error(`the page heard ${heard} keys the menu used`);
       // Rows that just came take no click in their first 300 ms (video.js).
       await sleep(500);
       const row = (await t.session.picks("row")).rows[0];
