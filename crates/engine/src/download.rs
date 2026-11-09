@@ -2267,9 +2267,10 @@ async fn save_state(
     Ok(())
 }
 
-/// A 403 answer (or the bot check's), which a browser's User-Agent may have brought on (#372).
+/// A plain 403, which a browser's User-Agent may have brought on (#372). A site's bot check
+/// isn't asked again: that one stays the site's call (#376).
 fn agent_refused(e: &Error) -> bool {
-    matches!(e, Error::Status(s) if s.as_u16() == 403) || matches!(e, Error::BotCheck)
+    matches!(e, Error::Status(s) if s.as_u16() == 403)
 }
 
 /// A plain `GET` (no Range), or a POST of `post`, that must answer 200 or 206. A GET follows
