@@ -265,5 +265,8 @@
   },
   "remote_device_name": {
     "message": "Pārlūkprogrammas paplašinājums"
+  },
+  "popup_media_title_name": {
+    "message": "Pievienot lapas nosaukumu multivides failu nosaukumu priekšā"
   }
 }
