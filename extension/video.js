@@ -507,6 +507,9 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
   // free of the page's own controls (a thumbnail's watch-later button at the top right, #421).
   function spot(r, w, h, roomX, roomY) {
     if (chosen) return place;
+    // Still while its menu is open: the player's own controls come and go as the pointer moves
+    // over the video, and the menu's rows would move away from under it.
+    if (menuOpen && auto.v === video && auto.at) return auto.at;
     const now = Date.now();
     if (auto.v === video && now - auto.t < AUTO_MS) return auto.at;
     let at = place;
@@ -955,7 +958,8 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
 
   // Keys (only the user's own, never ones a page script makes up): Escape closes the open menu
   // (the keyboard's focus back on its button), arrows move through it, Enter and Space run the
-  // focused command.
+  // focused command. Each stops there: a key the open menu used is not the page's too (a player's
+  // Space and arrows would pause it and change its volume behind the menu).
   shadow.addEventListener("keydown", (e) => {
     if (!e.isTrusted) return;
     const focused = shadow.activeElement;
@@ -969,6 +973,7 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
       if (panel === picks) choosePick(focused);
       else run(focused.dataset.act);
       e.preventDefault();
+      e.stopPropagation();
     } else if (menuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
       const items = [...panel.querySelectorAll("button")];
       const i = items.indexOf(focused);
@@ -977,6 +982,7 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
       const next = i < 0 ? (down ? 0 : items.length - 1) : (i + (down ? 1 : items.length - 1)) % items.length;
       items[next]?.focus();
       e.preventDefault();
+      e.stopPropagation();
     }
   });
 

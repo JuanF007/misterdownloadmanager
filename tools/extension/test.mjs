@@ -1511,6 +1511,11 @@ const MPD = (protect) => `<?xml version="1.0"?>
   // row's number alone; nothing is asked on a timer of its own, nor before a click.
   assert.ok(/shadow\.addEventListener\("keydown", \(e\) => \{\s*if \(!e\.isTrusted\) return;/.test(source), "keys: the user's own");
   assert.ok(/picks\.addEventListener\("click", \(e\) => \{\s*if \(!e\.isTrusted\) return;/.test(source), "rows: the user's own clicks");
+  // The page's own controls: a key the open menu used doesn't reach the page, and the button (and
+  // so its menu) stays where it is while the menu is open.
+  const keys = source.slice(source.indexOf('shadow.addEventListener("keydown"'), source.indexOf("// The main part: a click downloads"));
+  assert.equal(keys.match(/e\.stopPropagation\(\)/g).length, 3, "Escape, Enter and Space, the arrows: not the page's too");
+  assert.ok(fn("spot").includes("if (menuOpen && auto.v === video && auto.at) return auto.at;"), "spot: still while its menu is open");
   assert.equal(source.match(/innerHTML/g).length, 1, "markup only for the fixed parts");
   assert.ok(!/insertAdjacentHTML|outerHTML|setInterval/.test(source));
   assert.ok(/send\(\{ type: "video-pick", token: j\.token, choice: i \}\)/.test(fn("pick")), "a pick: the token and the row's number");
