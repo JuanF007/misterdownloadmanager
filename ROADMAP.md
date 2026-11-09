@@ -13,6 +13,8 @@ Everything below ships together, in version 0.5.0.
 
 ### Done
 
+- ✅ A freeze that was over before its dump was taken is reported as a freeze, not a crash in the
+  watchdog (part of [#420](https://github.com/anefzaoui/misterdownloadmanager/issues/420))
 - ✅ Freeze reports taken after the window has already answered say so, instead of blaming a deadlock
   (part of [#355](https://github.com/anefzaoui/misterdownloadmanager/issues/355))
 - ✅ **Move/Rename** works on several selected downloads at once: pick a folder and they all go there
