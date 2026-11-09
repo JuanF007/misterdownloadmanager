@@ -230,7 +230,9 @@ impl Lookups {
         })
     }
 
-    fn prune(&mut self, now: Instant) {
+    /// Forgets the look-ups past [`TTL`], which keep a page's cookies: on the app's clock too, so
+    /// with no other look-up coming along.
+    pub fn prune(&mut self, now: Instant) {
         self.searches
             .retain(|_, s| now.saturating_duration_since(s.created) < TTL);
     }
