@@ -277,6 +277,14 @@
     "message": "Could not look it up",
     "description": "in the menu under the download button over a video: finding the video's qualities failed; the app's own explanation follows on the next line"
   },
+  "video_tab_video": {
+    "message": "Video",
+    "description": "tab above the list of qualities in the menu under the download button over a video: the choices that include picture (video with sound); short, one word"
+  },
+  "video_tab_audio": {
+    "message": "Audio",
+    "description": "tab above the list of qualities in the menu under the download button over a video: the choices that are sound only (MP3, Opus and the like); short, one word"
+  },
   "popup_send_to": {
     "message": "Send downloads to",
     "description": "heading in the toolbar button's popup, above the choice of where downloads go"

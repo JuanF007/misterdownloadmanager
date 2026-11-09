@@ -2,8 +2,19 @@
 //! the video up with yt-dlp on a thread of its own and answers at once with a token
 //! (`video_lookup`); the browser asks how it goes (`video_poll`) and sends the choice made there
 //! (`video_pick`), a place in the list MDM offered, which MDM downloads with its own selector for
-//! it and the look-up's own browser context. Nothing is shared between look-ups (a private
-//! window's never meets another's, a failure is never reused), and none is kept past 10 minutes.
+//! it and the look-up's own browser context.
+//!
+//! Faster than a look-up and a download each running yt-dlp on the page:
+//! - an HLS stream's playlist MDM can read exactly as yt-dlp would is read by MDM itself
+//!   (`mdm_tools::manifest`), and its qualities offered a second and more sooner; yt-dlp looks
+//!   it up at the same time, for the download;
+//! - yt-dlp's look-up is kept as it answered (`InfoSlot`), and the download chosen from it
+//!   starts from it instead of reading the page again (`mdm_tools::video::Preloaded`);
+//! - a second click on the same video, with exactly the same browser context, shares the first
+//!   one's look-up while it runs or once it found the video ([`Lookups::share`]).
+//!
+//! Nothing else is shared between look-ups (a private window's never meets another's, a failure
+//! is never reused), and none is kept past 10 minutes.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use mdm_ipc::api::{VideoChoice, VideoLookupAnswer, lookup};
 use mdm_tools::resolve::{Choice, Looked, Video};
-use mdm_tools::video::Subs;
+use mdm_tools::video::{InfoSlot, LOOKUP_WAIT, Preloaded, Subs};
 
 use crate::videodlg::VideoAdd;
 
@@ -65,7 +76,7 @@ fn lock(found: &Shared) -> MutexGuard<'_, Found> {
     found.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// One look-up.
+/// One look-up's token.
 struct Search {
     /// What yt-dlp looks up.
     address: String,
@@ -76,6 +87,49 @@ struct Search {
     store_id: Option<String>,
     created: Instant,
     found: Shared,
+    /// yt-dlp's look-up as it answered, for the download chosen from it.
+    info: InfoSlot,
+    /// Its choices are merged qualities (ffmpeg was there).
+    merge: bool,
+}
+
+/// What makes two clicks one look-up ([`Lookups::share`]): the address looked up and everything
+/// of the browser's context yt-dlp asks with, exactly, and merged choices or not. Not the page's
+/// title: each click keeps its own (the file is named after its page, #345).
+#[derive(PartialEq)]
+struct Key {
+    address: String,
+    private: bool,
+    store_id: Option<String>,
+    cookies: Option<String>,
+    jar: Vec<mdm_ipc::BrowserCookie>,
+    referer: Option<String>,
+    user_agent: Option<String>,
+    merge: bool,
+}
+
+impl Key {
+    fn of(context: &mdm_ipc::Command, store_id: &Option<String>, merge: bool) -> Key {
+        Key {
+            address: context.video_page.clone().unwrap_or_default(),
+            private: context.private,
+            store_id: store_id.clone(),
+            cookies: context.cookies.clone(),
+            jar: context.cookie_jar.clone(),
+            referer: context.referer.clone(),
+            user_agent: context.user_agent.clone(),
+            merge,
+        }
+    }
+}
+
+/// A look-up another click may share ([`Lookups::share`]), kept apart from the tokens: a choice
+/// taken from one of them leaves it here.
+struct Recent {
+    key: Key,
+    started: Instant,
+    found: Shared,
+    info: InfoSlot,
 }
 
 /// A running look-up's place among the [`RUNNING`]: given back when dropped, however its
@@ -95,6 +149,9 @@ pub struct Job {
     /// yt-dlp's view of the look-up's browser context.
     pub browser: mdm_tools::proc::FromBrowser,
     pub found: Shared,
+    pub info: InfoSlot,
+    /// The qualities that need merging are offered (ffmpeg is there).
+    pub merge: bool,
     pub running: Running,
 }
 
@@ -105,12 +162,17 @@ pub struct Picked {
     pub context: mdm_ipc::Command,
     pub video: Video,
     pub choice: Choice,
+    /// yt-dlp's look-up, for the download (its `Debug` shows nothing of it).
+    pub info: InfoSlot,
+    pub merge: bool,
 }
 
 /// The look-ups the browser's quality menu asked for (`App::lookups`).
 #[derive(Default)]
 pub struct Lookups {
     searches: HashMap<String, Search>,
+    /// The look-ups a click may share, at most [`KEPT`], for [`TTL`] after they began.
+    recent: Vec<Recent>,
     running: Arc<AtomicUsize>,
 }
 
@@ -126,26 +188,81 @@ impl Lookups {
         rt: tokio::runtime::Handle,
         now: Instant,
     ) -> VideoLookupAnswer {
-        let Some(job) = self.begin(ask, cmd, now) else {
+        // The qualities that need merging, when ffmpeg is there (as the window offers them).
+        let merge = mdm_tools::tools_dir()
+            .as_deref()
+            .and_then(mdm_tools::ffmpeg::installed)
+            .is_some();
+        if let Some(token) = self.share(ask, cmd, merge, now) {
+            return self.poll(&token, now);
+        }
+        let Some(job) = self.begin(ask, cmd, merge, now) else {
             return VideoLookupAnswer::of(lookup::BUSY);
         };
-        let (token, found) = (job.token.clone(), job.found.clone());
+        let (token, found, info) = (job.token.clone(), job.found.clone(), job.info.clone());
         match run(job, exe, rt) {
             Ok(()) => VideoLookupAnswer::pending(&token),
             // No thread for it (its place came back with the job): said as yt-dlp's error is.
             Err(e) => {
                 *lock(&found) = Found::Failed(e.to_string());
+                info.fail();
                 self.poll(&token, now)
             }
         }
     }
 
-    /// A new look-up of `ask` with the browser's context of `cmd`, for the caller to run
-    /// ([`run`]); none (`busy`) while [`RUNNING`] run already.
+    /// A token of its own for an earlier look-up of the same thing as `ask` with the browser's
+    /// context of `cmd` (a second click on the same video): the same address, the same context
+    /// for yt-dlp (kind of window, cookie store, cookies, cookie jar, referrer, User-Agent, all
+    /// exactly) and the same kind of choices (`merge`). Shared while it runs, if it began less
+    /// than [`LOOKUP_WAIT`] ago (no second yt-dlp, no place among the [`RUNNING`] taken), or once
+    /// it found the video, within [`TTL`] of its start, never longer. A failure or a list is
+    /// never shared: the click looks it up again. None: nothing to share.
+    pub fn share(
+        &mut self,
+        ask: &mdm_ipc::VideoLookup,
+        cmd: &mdm_ipc::Command,
+        merge: bool,
+        now: Instant,
+    ) -> Option<String> {
+        self.prune(now);
+        let context = context_of(ask, cmd);
+        let store_id = store(&ask.store_id);
+        let key = Key::of(&context, &store_id, merge);
+        let earlier = self.recent.iter().find(|r| {
+            let age = now.saturating_duration_since(r.started);
+            r.key == key
+                && match &*lock(&r.found) {
+                    Found::Looking => age < LOOKUP_WAIT,
+                    Found::Video(..) => age < TTL,
+                    Found::List | Found::Failed(_) => false,
+                }
+        })?;
+        let (found, info) = (earlier.found.clone(), earlier.info.clone());
+        self.make_room();
+        let token = mdm_ipc::random_token();
+        self.searches.insert(
+            token.clone(),
+            Search {
+                address: key.address,
+                context,
+                store_id,
+                created: now,
+                found,
+                info,
+                merge,
+            },
+        );
+        Some(token)
+    }
+
+    /// A new look-up of `ask` with the browser's context of `cmd` (`merge`: offering merged
+    /// qualities), for the caller to run ([`run`]); none (`busy`) while [`RUNNING`] run already.
     pub fn begin(
         &mut self,
         ask: &mdm_ipc::VideoLookup,
         cmd: &mdm_ipc::Command,
+        merge: bool,
         now: Instant,
     ) -> Option<Job> {
         self.prune(now);
@@ -156,6 +273,51 @@ impl Lookups {
         }
         self.running.fetch_add(1, Ordering::SeqCst);
         let running = Running(self.running.clone());
+        self.make_room();
+        let token = mdm_ipc::random_token();
+        let context = context_of(ask, cmd);
+        let address = context.video_page.clone().unwrap_or_default();
+        let store_id = store(&ask.store_id);
+        let found = Shared::default();
+        let info = InfoSlot::new(now);
+        let job = Job {
+            token: token.clone(),
+            address: address.clone(),
+            browser: crate::videodlg::from_browser(&context),
+            found: found.clone(),
+            info: info.clone(),
+            merge,
+            running,
+        };
+        // The one a later click shares, in place of any earlier one of the same thing.
+        let key = Key::of(&context, &store_id, merge);
+        self.recent.retain(|r| r.key != key);
+        while self.recent.len() >= KEPT {
+            self.recent.remove(0);
+        }
+        self.recent.push(Recent {
+            key,
+            started: now,
+            found: found.clone(),
+            info: info.clone(),
+        });
+        self.searches.insert(
+            token,
+            Search {
+                address,
+                context,
+                store_id,
+                created: now,
+                found,
+                info,
+                merge,
+            },
+        );
+        Some(job)
+    }
+
+    /// Room for one more token: the oldest forgotten while [`KEPT`] are there.
+    fn make_room(&mut self) {
         while self.searches.len() >= KEPT {
             let oldest = self
                 .searches
@@ -167,28 +329,6 @@ impl Lookups {
                 None => break,
             };
         }
-        let token = mdm_ipc::random_token();
-        let context = context_of(ask, cmd);
-        let address = context.video_page.clone().unwrap_or_default();
-        let found = Shared::default();
-        let job = Job {
-            token: token.clone(),
-            address: address.clone(),
-            browser: crate::videodlg::from_browser(&context),
-            found: found.clone(),
-            running,
-        };
-        self.searches.insert(
-            token,
-            Search {
-                address,
-                context,
-                store_id: store(&ask.store_id),
-                created: now,
-                found,
-            },
-        );
-        Some(job)
     }
 
     /// How look-up `token` goes (`gone`: never given, or forgotten).
@@ -227,6 +367,8 @@ impl Lookups {
             context: s.context,
             video,
             choice,
+            info: s.info,
+            merge: s.merge,
         })
     }
 
@@ -235,6 +377,8 @@ impl Lookups {
     pub fn prune(&mut self, now: Instant) {
         self.searches
             .retain(|_, s| now.saturating_duration_since(s.created) < TTL);
+        self.recent
+            .retain(|r| now.saturating_duration_since(r.started) < TTL);
     }
 }
 
@@ -298,6 +442,7 @@ fn answer(token: &str, s: &Search) -> VideoLookupAnswer {
                     label: crate::videodlg::choice_label(&c.label),
                     ext: c.ext.clone(),
                     size: c.size,
+                    audio: mdm_tools::resolve::is_audio(c),
                 })
                 .collect(),
             ..VideoLookupAnswer::of(lookup::READY)
@@ -321,7 +466,8 @@ fn answer(token: &str, s: &Search) -> VideoLookupAnswer {
 /// The download choice `p` adds, into `folder` (the Video category's): MDM's own selector for
 /// it, the file named as the Download video window names it, the subtitles that window would
 /// preselect from `pref` (settings.video_subs, not changed by it), started now unless
-/// `start_now` is false (Options: only add to the queue). None for an address MDM can't take.
+/// `start_now` is false (Options: only add to the queue), from the look-up's own yt-dlp answer
+/// (its first run). None for an address MDM can't take.
 pub fn video_add(p: Picked, folder: &Path, start_now: bool, pref: &Subs) -> Option<VideoAdd> {
     let page = url::Url::parse(&p.address)
         .ok()
@@ -336,13 +482,86 @@ pub fn video_add(p: Picked, folder: &Path, start_now: bool, pref: &Subs) -> Opti
         subs: crate::videodlg::default_subs(&p.video, &p.choice, pref),
         context: p.context,
         remember: None,
+        preloaded: Some(Preloaded {
+            slot: p.info,
+            selector: p.choice.selector,
+            label: p.choice.label,
+            merge: p.merge,
+        }),
     })
 }
 
+/// Writes the look-up's end when its thread ends without one (a panic on it): nothing stays
+/// "looking" (a second click would share it) nor pending (its download would wait for it).
+struct Ended {
+    found: Shared,
+    info: InfoSlot,
+}
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        let mut found = lock(&self.found);
+        if matches!(*found, Found::Looking) {
+            // yt-dlp's words for an end without an answer.
+            *found = Found::Failed(
+                mdm_tools::proc::ProcError::Failed {
+                    tool: "yt-dlp".into(),
+                    message: "it stopped without saying why".into(),
+                }
+                .to_string(),
+            );
+        }
+        self.info.fail();
+    }
+}
+
+/// yt-dlp's look-up as `videodlg::look_up_kept` makes it: what it found, and its answer as it
+/// gave it.
+type Kept = (Result<Looked, String>, Option<mdm_tools::proc::LookedUp>);
+
+/// A look-up's two readings at once, the first answer taking the menu: MDM's own of a stream's
+/// playlists (`fast`, on the runtime `rt`, 5 s at most; preferred, and much the quicker), and
+/// yt-dlp's (`slow`, on this thread), started at once whatever the other does (a slow playlist
+/// server never holds it up) and kept for the download either way (`info`). An answer once
+/// written stays (the browser may be showing its choices, and picks by place in them); a
+/// failure of yt-dlp's waits for MDM's reading, which may still bring the video.
+fn settle(
+    found: &Shared,
+    info: &InfoSlot,
+    merge: bool,
+    rt: &tokio::runtime::Handle,
+    fast: impl std::future::Future<Output = Option<Video>> + Send + 'static,
+    slow: impl FnOnce() -> Kept,
+) {
+    let mine = found.clone();
+    let reading = rt.spawn(async move {
+        if let Some(v) = fast.await {
+            let mut found = lock(&mine);
+            if matches!(*found, Found::Looking) {
+                *found = Found::of(Ok(Looked::Video(v)), merge);
+            }
+        }
+    });
+    let (res, kept) = slow();
+    match (&res, kept) {
+        (Ok(Looked::Video(_)), Some(out)) => info.fill(out.json, out.without_cookies),
+        _ => info.fail(),
+    }
+    if res.is_err() {
+        let _ = rt.block_on(reading);
+    }
+    let mut found = lock(found);
+    if matches!(*found, Found::Looking) {
+        *found = Found::of(res, merge);
+    }
+}
+
 /// Run `job` with yt-dlp `exe` on a thread of its own, as the Download video window looks a
-/// video up (`rt`: a plain file's size from its server): its state written when yt-dlp answers
-/// (within its 90 s), its place given back as the thread ends. A look-up forgotten meanwhile
-/// (10 minutes, or 20 newer ones) ends all the same, with nothing to read it.
+/// video up (`rt`: a plain file's size from its server, and an HLS stream's playlists): its
+/// state written when yt-dlp answers (within its 90 s, twice that without the cookies), or
+/// sooner when MDM reads the stream itself ([`settle`]), its place given back as the thread
+/// ends. A look-up forgotten meanwhile (10 minutes, or 20 newer ones) ends all the same, with
+/// nothing to read it.
 pub fn run(job: Job, exe: PathBuf, rt: tokio::runtime::Handle) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("mdm-video-lookup".into())
@@ -351,16 +570,27 @@ pub fn run(job: Job, exe: PathBuf, rt: tokio::runtime::Handle) -> std::io::Resul
                 address,
                 browser,
                 found,
+                info,
+                merge,
                 running,
                 ..
             } = job;
-            let res = crate::videodlg::look_up(&exe, &address, &browser, &rt);
-            // The qualities that need merging, when ffmpeg is there (as the window offers them).
-            let merge = mdm_tools::tools_dir()
-                .as_deref()
-                .and_then(mdm_tools::ffmpeg::installed)
-                .is_some();
-            *lock(&found) = Found::of(res, merge);
+            let _ended = Ended {
+                found: found.clone(),
+                info: info.clone(),
+            };
+            // A stream's playlist MDM reads exactly as yt-dlp would (as Options' proxy and the
+            // browser's request for it); none for anything else.
+            let fast = {
+                let (address, browser) = (address.clone(), browser.clone());
+                let opts = crate::settings::own_net();
+                async move { mdm_tools::manifest::fetch(&address, &browser, &opts).await }
+            };
+            // yt-dlp's look-up all the same (the click asked for the video): kept for the
+            // download, and the menu's answer when MDM can't read the stream.
+            settle(&found, &info, merge, &rt, fast, || {
+                crate::videodlg::look_up_kept(&exe, &address, &browser, &rt)
+            });
             drop(running);
         })?;
     Ok(())
@@ -426,11 +656,12 @@ mod tests {
                     Some("firefox-container-1"),
                 ),
                 &sent(false, "a=1"),
+                false,
                 now,
             )
             .unwrap();
         let b = l
-            .begin(&look(PAGE, None, None), &sent(false, "b=2"), now)
+            .begin(&look(PAGE, None, None), &sent(false, "b=2"), false, now)
             .unwrap();
         assert_ne!(a.token, b.token);
         assert_eq!(a.token.len(), 64);
@@ -462,6 +693,7 @@ mod tests {
         );
         assert_eq!(ready.choices[0].ext, "mp4");
         assert_eq!(ready.choices[0].size, Some(60 * 2500 * 125), "estimated");
+        assert!(ready.choices.iter().all(|c| !c.audio), "videos");
         assert_eq!(l.poll(&b.token, now).state, lookup::PENDING, "its own");
         // The choice takes the look-up's context and MDM's selector for that place.
         let p = l
@@ -493,11 +725,12 @@ mod tests {
             .begin(
                 &look(PAGE, None, Some("firefox-private")),
                 &sent(true, "p=1"),
+                false,
                 now,
             )
             .unwrap();
         let normal = l
-            .begin(&look(PAGE, None, None), &sent(false, "n=1"), now)
+            .begin(&look(PAGE, None, None), &sent(false, "n=1"), false, now)
             .unwrap();
         answered(&private, STREAM);
         answered(&normal, STREAM);
@@ -529,6 +762,329 @@ mod tests {
         );
     }
 
+    /// A second click on the same video, with the same browser context, gets a token of its own
+    /// for the first click's look-up: no second yt-dlp, no place among the two taken, the same
+    /// answer when it comes, yt-dlp's kept answer for its download; its own page title (each
+    /// click names its file after its page). Shared after a choice was taken from it, too.
+    #[test]
+    fn a_second_click_shares_the_first_look_up() {
+        let mut l = Lookups::default();
+        let now = Instant::now();
+        let first = l
+            .begin(
+                &look(SRC, Some("Talk A"), None),
+                &sent(false, "a=1"),
+                false,
+                now,
+            )
+            .unwrap();
+        let other = l
+            .begin(&look(PAGE, None, None), &sent(false, "b=2"), false, now)
+            .unwrap();
+        // Both places taken: still shared.
+        let later = now + Duration::from_secs(30);
+        let second = l
+            .share(
+                &look(SRC, Some("Talk B"), None),
+                &sent(false, "a=1"),
+                false,
+                later,
+            )
+            .expect("shared");
+        assert_ne!(second, first.token);
+        assert_eq!(l.running.load(Ordering::SeqCst), RUNNING, "no place taken");
+        assert_eq!(l.poll(&second, later), VideoLookupAnswer::pending(&second));
+        answered(&first, STREAM);
+        first.info.fill(STREAM.as_bytes().to_vec(), false);
+        let (a, b) = (l.poll(&first.token, later), l.poll(&second, later));
+        assert_eq!(
+            (a.state.as_str(), b.state.as_str()),
+            (lookup::READY, lookup::READY)
+        );
+        assert_eq!(a.choices, b.choices);
+        assert_eq!(
+            (a.title.as_deref(), b.title.as_deref()),
+            (Some("Talk A"), Some("Talk B")),
+            "each its own page's"
+        );
+        let p = l.pick(&pick(&second, 0, None), false, later).unwrap();
+        assert!(!p.info.pending(), "the first click's yt-dlp answer");
+        assert_eq!(p.context.video_title.as_deref(), Some("Talk B"));
+        // A choice taken leaves it to share.
+        assert!(
+            l.share(&look(SRC, None, None), &sent(false, "a=1"), false, later)
+                .is_some()
+        );
+        drop(other);
+    }
+
+    /// The context a second click must share exactly, one part of it changed.
+    fn shares_with(change: impl Fn(&mut VideoLookup, &mut Command, &mut bool)) -> bool {
+        let mut l = Lookups::default();
+        let now = Instant::now();
+        let base = || {
+            let mut cmd = sent(false, "a=1");
+            cmd.cookie_jar = vec![mdm_ipc::BrowserCookie {
+                name: "sid".into(),
+                value: "1".into(),
+                domain: ".cdn.test".into(),
+                ..Default::default()
+            }];
+            (
+                look(SRC, Some("A talk"), Some("firefox-container-1")),
+                cmd,
+                false,
+            )
+        };
+        let (ask, cmd, merge) = base();
+        let job = l.begin(&ask, &cmd, merge, now).unwrap();
+        let (mut ask, mut cmd, mut merge) = base();
+        change(&mut ask, &mut cmd, &mut merge);
+        let shared = l.share(&ask, &cmd, merge, now).is_some();
+        drop(job);
+        shared
+    }
+
+    #[test]
+    fn the_same_context_shares() {
+        assert!(shares_with(|_, _, _| {}));
+        // The page's title isn't part of it.
+        assert!(shares_with(
+            |a, _, _| a.title = Some("Another tab's title".into())
+        ));
+    }
+
+    #[test]
+    fn another_address_is_its_own_look_up() {
+        assert!(!shares_with(|a, _, _| a.address = PAGE.into()));
+    }
+
+    #[test]
+    fn another_kind_of_window_is_its_own_look_up() {
+        assert!(!shares_with(|_, c, _| c.private = true));
+    }
+
+    #[test]
+    fn another_cookie_store_is_its_own_look_up() {
+        assert!(!shares_with(
+            |a, _, _| a.store_id = Some("firefox-container-2".into())
+        ));
+        assert!(!shares_with(|a, _, _| a.store_id = None));
+    }
+
+    #[test]
+    fn other_cookies_are_their_own_look_up() {
+        assert!(!shares_with(|_, c, _| c.cookies = Some("a=2".into())));
+        assert!(!shares_with(|_, c, _| c.cookies = None));
+    }
+
+    #[test]
+    fn another_cookie_jar_is_its_own_look_up() {
+        assert!(!shares_with(|_, c, _| c.cookie_jar[0].value = "2".into()));
+        assert!(!shares_with(|_, c, _| c.cookie_jar.clear()));
+    }
+
+    #[test]
+    fn another_referrer_is_its_own_look_up() {
+        assert!(!shares_with(
+            |_, c, _| c.referer = Some("https://videos.test/other".into())
+        ));
+    }
+
+    #[test]
+    fn another_user_agent_is_its_own_look_up() {
+        assert!(!shares_with(|_, c, _| c.user_agent = Some("UA/2".into())));
+    }
+
+    #[test]
+    fn other_choices_are_their_own_look_up() {
+        assert!(!shares_with(|_, _, m| *m = true));
+    }
+
+    /// Never shared: a failure or a list (the click looks it up again), a look-up running longer
+    /// than it may, a video found more than ten minutes after its look-up began (however late a
+    /// click shared it before).
+    #[test]
+    fn what_a_click_never_shares() {
+        let now = Instant::now();
+        let ask = look(SRC, None, None);
+        let cmd = sent(false, "a=1");
+        let mut l = Lookups::default();
+        let job = l.begin(&ask, &cmd, false, now).unwrap();
+        *lock(&job.found) = Found::Failed("yt-dlp failed".into());
+        assert!(l.share(&ask, &cmd, false, now).is_none());
+        *lock(&job.found) = Found::List;
+        assert!(l.share(&ask, &cmd, false, now).is_none());
+        *lock(&job.found) = Found::Looking;
+        assert!(
+            l.share(
+                &ask,
+                &cmd,
+                false,
+                now + LOOKUP_WAIT - Duration::from_secs(1)
+            )
+            .is_some()
+        );
+        assert!(l.share(&ask, &cmd, false, now + LOOKUP_WAIT).is_none());
+        answered(&job, STREAM);
+        let late = now + TTL - Duration::from_secs(1);
+        let token = l.share(&ask, &cmd, false, late).unwrap();
+        assert!(
+            l.share(&ask, &cmd, false, now + TTL).is_none(),
+            "never extended"
+        );
+        // The token given late lives its own ten minutes.
+        assert_eq!(l.poll(&token, now + TTL).state, lookup::READY);
+        // A new look-up of the same thing takes the old one's place.
+        let mut l = Lookups::default();
+        let a = l.begin(&ask, &cmd, false, now).unwrap();
+        let b = l.begin(&ask, &cmd, false, now).unwrap();
+        answered(&a, STREAM);
+        let t = l.share(&ask, &cmd, false, now).unwrap();
+        answered(&b, &STREAM.replace("hls-2500", "other"));
+        assert!(Arc::ptr_eq(&l.searches[&t].found, &b.found));
+        // At most KEPT of them.
+        let mut l = Lookups::default();
+        for i in 0..KEPT + 5 {
+            let job = l
+                .begin(&look(&format!("{SRC}?{i}"), None, None), &cmd, false, now)
+                .unwrap();
+            drop(job);
+        }
+        assert_eq!(l.recent.len(), KEPT);
+    }
+
+    /// A look-up's thread that ends without an answer (a panic) leaves it failed, never
+    /// "looking" (a second click would share it) nor its yt-dlp answer pending (its download
+    /// would wait for it).
+    #[test]
+    fn a_look_up_ended_without_an_answer_is_failed() {
+        let found = Shared::default();
+        let info = InfoSlot::new(Instant::now());
+        let (f, i) = (found.clone(), info.clone());
+        let ended = std::thread::spawn(move || {
+            let _ended = Ended { found: f, info: i };
+            panic!("on the look-up's thread");
+        })
+        .join();
+        assert!(ended.is_err());
+        assert!(
+            matches!(&*lock(&found), Found::Failed(e) if e.contains("stopped without saying why"))
+        );
+        assert!(!info.pending());
+        // The menu's answer stays when only yt-dlp's for the download is missing.
+        let found: Shared = Arc::new(Mutex::new(Found::List));
+        let info = InfoSlot::new(Instant::now());
+        drop(Ended {
+            found: found.clone(),
+            info: info.clone(),
+        });
+        assert!(matches!(&*lock(&found), Found::List));
+        assert!(!info.pending());
+    }
+
+    /// MDM's reading of a stream and yt-dlp's run at once: yt-dlp starts at once however slow
+    /// the stream's server, the first answer takes the menu and stays, MDM's reading wins
+    /// against a yt-dlp that failed; yt-dlp's answer is kept for the download either way.
+    #[test]
+    fn the_two_readings_run_at_once() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let video = |title: &str| {
+            mdm_tools::resolve::parse(
+                STREAM
+                    .replace("\"master\"", &format!("{title:?}"))
+                    .as_bytes(),
+            )
+            .unwrap()
+        };
+        let ytdlp = |title: &str| -> Kept {
+            (
+                Ok(Looked::Video(video(title))),
+                Some(mdm_tools::proc::LookedUp {
+                    json: STREAM.as_bytes().to_vec(),
+                    without_cookies: false,
+                }),
+            )
+        };
+        let failed = || -> Kept { (Err("yt-dlp failed: no".into()), None) };
+        let title = |found: &Shared| match &*lock(found) {
+            Found::Video(v, _) => v.title.clone(),
+            Found::Failed(e) => format!("failed: {e}"),
+            _ => "other".into(),
+        };
+        let reading = |title: &'static str, ms: u64| {
+            let v = (!title.is_empty()).then(|| video(title));
+            async move {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                v
+            }
+        };
+        let fresh = || (Shared::default(), InfoSlot::new(Instant::now()));
+
+        // MDM's reading first: the menu's; yt-dlp's kept for the download.
+        let (found, info) = fresh();
+        settle(
+            &found,
+            &info,
+            false,
+            rt.handle(),
+            reading("mine", 0),
+            || {
+                std::thread::sleep(Duration::from_millis(200));
+                ytdlp("yt-dlp's")
+            },
+        );
+        assert_eq!(title(&found), "mine");
+        assert!(!info.pending());
+
+        // yt-dlp first: its answer, which MDM's later reading doesn't replace.
+        let (found, info) = fresh();
+        settle(
+            &found,
+            &info,
+            false,
+            rt.handle(),
+            reading("mine", 300),
+            || ytdlp("yt-dlp's"),
+        );
+        assert_eq!(title(&found), "yt-dlp's");
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(title(&found), "yt-dlp's", "stays");
+        drop(info);
+
+        // yt-dlp failed first: MDM's reading still brings the video.
+        let (found, info) = fresh();
+        settle(
+            &found,
+            &info,
+            false,
+            rt.handle(),
+            reading("mine", 200),
+            failed,
+        );
+        assert_eq!(title(&found), "mine");
+        assert!(!info.pending(), "nothing kept: the download looks it up");
+
+        // Both fail: yt-dlp's error.
+        let (found, info) = fresh();
+        settle(&found, &info, false, rt.handle(), reading("", 100), failed);
+        assert_eq!(title(&found), "failed: yt-dlp failed: no");
+        drop(info);
+
+        // A slow playlist server never holds yt-dlp up.
+        let (found, info) = fresh();
+        let begun = Instant::now();
+        let mut started = None;
+        settle(&found, &info, false, rt.handle(), reading("", 3000), || {
+            started = Some(begun.elapsed());
+            ytdlp("yt-dlp's")
+        });
+        assert!(started.unwrap() < Duration::from_millis(100), "{started:?}");
+        assert!(begun.elapsed() < Duration::from_secs(1));
+        assert_eq!(title(&found), "yt-dlp's");
+        drop(info);
+    }
+
     /// The menu looks up what the Download video window would: Dailymotion's embedded player is
     /// the video's own page (#359), downloaded from there too.
     #[test]
@@ -538,7 +1094,7 @@ mod tests {
         let player = "https://geo.dailymotion.com/player/x19jsm.html?video=k4lGbCpdJJFSQgMvE8W";
         let own = "https://www.dailymotion.com/video/k4lGbCpdJJFSQgMvE8W";
         let job = l
-            .begin(&look(player, None, None), &sent(false, ""), now)
+            .begin(&look(player, None, None), &sent(false, ""), false, now)
             .unwrap();
         assert_eq!(job.address, own);
         answered(&job, STREAM);
@@ -556,13 +1112,13 @@ mod tests {
         let mut l = Lookups::default();
         let now = Instant::now();
         let a = l
-            .begin(&look(PAGE, None, None), &sent(false, ""), now)
+            .begin(&look(PAGE, None, None), &sent(false, ""), false, now)
             .unwrap();
         let b = l
-            .begin(&look(PAGE, None, None), &sent(false, ""), now)
+            .begin(&look(PAGE, None, None), &sent(false, ""), false, now)
             .unwrap();
         assert!(
-            l.begin(&look(PAGE, None, None), &sent(false, ""), now)
+            l.begin(&look(PAGE, None, None), &sent(false, ""), false, now)
                 .is_none(),
             "busy"
         );
@@ -570,10 +1126,10 @@ mod tests {
         let Job { running, .. } = a;
         std::thread::spawn(move || drop(running)).join().unwrap();
         let c = l
-            .begin(&look(PAGE, None, None), &sent(false, ""), now)
+            .begin(&look(PAGE, None, None), &sent(false, ""), false, now)
             .unwrap();
         assert!(
-            l.begin(&look(PAGE, None, None), &sent(false, ""), now)
+            l.begin(&look(PAGE, None, None), &sent(false, ""), false, now)
                 .is_none()
         );
         // Forgotten tokens' threads still give their places back.
@@ -582,7 +1138,7 @@ mod tests {
         drop(b);
         drop(c);
         assert!(
-            l.begin(&look(PAGE, None, None), &sent(false, ""), later)
+            l.begin(&look(PAGE, None, None), &sent(false, ""), false, later)
                 .is_some()
         );
         assert_eq!(l.running.load(Ordering::SeqCst), 0, "dropped at once here");
@@ -594,7 +1150,7 @@ mod tests {
         let mut l = Lookups::default();
         let now = Instant::now();
         let first = l
-            .begin(&look(PAGE, None, None), &sent(false, ""), now)
+            .begin(&look(PAGE, None, None), &sent(false, ""), false, now)
             .unwrap()
             .token;
         assert_eq!(
@@ -607,6 +1163,7 @@ mod tests {
                 l.begin(
                     &look(PAGE, None, None),
                     &sent(false, ""),
+                    false,
                     now + Duration::from_millis(i),
                 )
                 .unwrap()
@@ -627,7 +1184,7 @@ mod tests {
         let mut l = Lookups::default();
         let now = Instant::now();
         let job = l
-            .begin(&look(SRC, None, None), &sent(false, ""), now)
+            .begin(&look(SRC, None, None), &sent(false, ""), false, now)
             .unwrap();
         let t = job.token.clone();
         assert!(
@@ -646,7 +1203,7 @@ mod tests {
             "forgotten"
         );
         let job = l
-            .begin(&look(SRC, None, None), &sent(false, ""), now)
+            .begin(&look(SRC, None, None), &sent(false, ""), false, now)
             .unwrap();
         *lock(&job.found) = Found::List;
         assert!(l.pick(&pick(&job.token, 0, None), false, now).is_none());
@@ -661,7 +1218,7 @@ mod tests {
         let mut l = Lookups::default();
         let now = Instant::now();
         let job = l
-            .begin(&look(PAGE, None, None), &sent(false, ""), now)
+            .begin(&look(PAGE, None, None), &sent(false, ""), false, now)
             .unwrap();
         answered(
             &job,
@@ -710,6 +1267,7 @@ mod tests {
             .begin(
                 &look(SRC, Some("A talk: in Lisbon"), None),
                 &sent(false, "a=1"),
+                false,
                 now,
             )
             .unwrap();
@@ -732,10 +1290,16 @@ mod tests {
             "the last video's choice, on this page too"
         );
         assert!(add.remember.is_none(), "the remembered choice stays");
+        // The look-up's yt-dlp answer goes with it, for the very choice made.
+        let pre = add.preloaded.as_ref().unwrap();
+        assert_eq!(
+            (pre.selector.as_str(), pre.label.as_str(), pre.merge),
+            ("b[height=720]", "720p MP4", false)
+        );
         // No page title (a page yt-dlp names itself), Options' "only add to the queue", a
         // language this page doesn't have.
         let job = l
-            .begin(&look(SRC, None, None), &sent(false, ""), now)
+            .begin(&look(SRC, None, None), &sent(false, ""), false, now)
             .unwrap();
         answered(&job, STREAM);
         let p = l.pick(&pick(&job.token, 1, None), false, now).unwrap();
@@ -754,6 +1318,7 @@ mod tests {
             .begin(
                 &look(PAGE, Some("The page's title"), None),
                 &sent(false, ""),
+                false,
                 now,
             )
             .unwrap();
@@ -768,7 +1333,12 @@ mod tests {
         assert_eq!(add.dest, folder.join("Its own title.mp4"));
         // Never an address that isn't on the web.
         let job = l
-            .begin(&look("file:///C:/v.mp4", None, None), &sent(false, ""), now)
+            .begin(
+                &look("file:///C:/v.mp4", None, None),
+                &sent(false, ""),
+                false,
+                now,
+            )
             .unwrap();
         answered(&job, STREAM);
         let p = l.pick(&pick(&job.token, 0, None), false, now).unwrap();

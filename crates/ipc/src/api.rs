@@ -170,6 +170,9 @@ pub struct VideoChoice {
     pub ext: String,
     /// Bytes, exact or estimated; null when unknown.
     pub size: Option<u64>,
+    /// Only the sound (an audio file, a conversion to MP3, Opus or FLAC): the menu lists these
+    /// apart from the videos. False from an app older than the field.
+    pub audio: bool,
 }
 
 /// [`VideoLookupAnswer::state`]'s values, and [`VideoLookupAnswer::reason`]'s.
@@ -195,9 +198,12 @@ pub mod lookup {
     pub const STARTED: &str = "started";
     /// The choice was added to the queue (Options: "only add to the queue").
     pub const QUEUED: &str = "queued";
-    /// The browser's host, never the app: MDM took the choice but didn't say in time what became
-    /// of it (`timeout`). The command is in its queue and will run, so the Download video window
-    /// mustn't do it a second time; the extension takes it for `started`.
+    /// MDM took the choice, and it isn't a new download: it is in the list already in that
+    /// quality (Options' "If a duplicate download link is added": that one was opened or
+    /// resumed, or MDM asks what to do in its own window). From the browser's host: MDM didn't
+    /// say in time what became of it (`timeout`); the command is in its queue and will run.
+    /// Either way the Download video window mustn't do it a second time; the extension takes it
+    /// for `started`.
     pub const SENT: &str = "sent";
     /// `failed`: yt-dlp isn't installed.
     pub const NO_YTDLP: &str = "no-ytdlp";
@@ -337,11 +343,13 @@ mod tests {
                     label: "720p mp4".into(),
                     ext: "mp4".into(),
                     size: Some(187_500_000),
+                    audio: false,
                 },
                 VideoChoice {
                     label: "Audio only mp3".into(),
                     ext: "mp3".into(),
                     size: None,
+                    audio: true,
                 },
             ],
             ..VideoLookupAnswer::of(lookup::READY)
@@ -349,12 +357,18 @@ mod tests {
         let json = line(&ready);
         assert_eq!(
             json,
-            r#"{"state":"ready","token":"abc","title":"A talk","choices":[{"label":"720p mp4","ext":"mp4","size":187500000},{"label":"Audio only mp3","ext":"mp3","size":null}]}"#
+            r#"{"state":"ready","token":"abc","title":"A talk","choices":[{"label":"720p mp4","ext":"mp4","size":187500000,"audio":false},{"label":"Audio only mp3","ext":"mp3","size":null,"audio":true}]}"#
         );
         assert_eq!(
             serde_json::from_str::<VideoLookupAnswer>(&json).unwrap(),
             ready
         );
+        // An older app's choices, without `audio`: none is sound alone.
+        let old: VideoLookupAnswer = serde_json::from_str(
+            r#"{"state":"ready","choices":[{"label":"Audio only mp3","ext":"mp3","size":null}]}"#,
+        )
+        .unwrap();
+        assert!(!old.choices[0].audio);
         let failed = VideoLookupAnswer::failed(lookup::ERROR, Some("Video unavailable".into()));
         assert_eq!(
             serde_json::from_str::<VideoLookupAnswer>(&line(&failed)).unwrap(),

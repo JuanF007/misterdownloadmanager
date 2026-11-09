@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "ಹುಡುಕಲು ಸಾಧ್ಯವಾಗಲಿಲ್ಲ"
   },
+  "video_tab_video": {
+    "message": "ವೀಡಿಯೊ"
+  },
+  "video_tab_audio": {
+    "message": "ಆಡಿಯೊ"
+  },
   "popup_send_to": {
     "message": "ಡೌನ್‌ಲೋಡ್‌ಗಳನ್ನು ಇಲ್ಲಿಗೆ ಕಳುಹಿಸಿ"
   },

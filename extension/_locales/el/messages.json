@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "Η αναζήτηση απέτυχε"
   },
+  "video_tab_video": {
+    "message": "Βίντεο"
+  },
+  "video_tab_audio": {
+    "message": "Ήχος"
+  },
   "popup_send_to": {
     "message": "Αποστολή λήψεων σε"
   },

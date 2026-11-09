@@ -36,6 +36,9 @@ pub struct VideoAdd {
     /// The Subtitles choice to remember for the next video (settings.video_subs); none when
     /// the page had no subtitles to choose from (the last real choice stays).
     pub remember: Option<Subs>,
+    /// The browser's quality menu's look-up the choice was made from, for the download's first
+    /// run (videolookup.rs); none from this window, whose download looks the page up itself.
+    pub preloaded: Option<mdm_tools::video::Preloaded>,
 }
 
 /// Which helper is being installed.
@@ -403,6 +406,7 @@ impl VideoDialog {
                     context: self.context(),
                     subs: subs_for_choice(c, &chosen),
                     remember: (!self.subs.is_empty()).then_some(chosen),
+                    preloaded: None,
                 }))
             }
         }
@@ -1110,14 +1114,28 @@ pub(crate) fn look_up(
     browser: &mdm_tools::proc::FromBrowser,
     rt: &tokio::runtime::Handle,
 ) -> Result<Looked, String> {
-    let mut res = mdm_tools::resolve::look_up(exe, page, browser).map_err(|e| e.to_string());
+    look_up_kept(exe, page, browser, rt).0
+}
+
+/// [`look_up`], with yt-dlp's answer as it gave it, when it gave one (the browser's quality menu
+/// keeps it for the download chosen there, `mdm_tools::video::Preloaded`).
+pub(crate) fn look_up_kept(
+    exe: &std::path::Path,
+    page: &str,
+    browser: &mdm_tools::proc::FromBrowser,
+    rt: &tokio::runtime::Handle,
+) -> (Result<Looked, String>, Option<mdm_tools::proc::LookedUp>) {
+    let (mut res, kept) = match mdm_tools::resolve::look_up_kept(exe, page, browser) {
+        Ok((looked, out)) => (Ok(looked), Some(out)),
+        Err(e) => (Err(e.to_string()), None),
+    };
     if let Ok(Looked::Video(v)) = &mut res
         && v.needs_size()
         && let Some(size) = direct_size(rt, page, browser)
     {
         v.set_size(size);
     }
-    res
+    (res, kept)
 }
 
 /// yt-dlp's view of the browser's request context.

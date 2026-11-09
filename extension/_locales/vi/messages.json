@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "Không thể tìm kiếm"
   },
+  "video_tab_video": {
+    "message": "Video"
+  },
+  "video_tab_audio": {
+    "message": "Âm thanh"
+  },
   "popup_send_to": {
     "message": "Gửi tải xuống đến"
   },

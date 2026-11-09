@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "検索できませんでした"
   },
+  "video_tab_video": {
+    "message": "ビデオ"
+  },
+  "video_tab_audio": {
+    "message": "オーディオ"
+  },
   "popup_send_to": {
     "message": "ダウンロードの送信先"
   },

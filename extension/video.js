@@ -52,6 +52,8 @@
     video_busy: "Mister Download Manager is busy with other videos",
     video_queued: "Added to the queue",
     video_failed_lookup: "Could not look it up",
+    video_tab_video: "Video",
+    video_tab_audio: "Audio",
   };
   // Sizes as the browser's language writes them.
   const lang = ext.i18n.getUILanguage?.() || undefined;
@@ -138,10 +140,18 @@
   // How long a lookup is followed, from the click.
   const LOOKUP_MS = 60000;
 
-  // The wait before asking again how a lookup is going: 1 s, a little longer each time, 2 s at
-  // most.
-  function pollDelay(n) {
-    return Math.min(2000, Math.round(1000 * 1.25 ** Math.max(0, n)));
+  // The wait before asking how a lookup is going: 100 ms before the first question. An app that
+  // held the last question while it looked (a newer one, up to ~1.5 s: `took` ms of HELD_MS or
+  // more) is asked again at once (50 ms), so the answer reaches the page as soon as it is ready.
+  // One that answers at once (an older one) is asked as seldom as ever: the old backoff's target
+  // (1 s, a little longer each time, 2 s at most) less the time the question took, 50 ms at least.
+  function pollDelay(n, took) {
+    const HELD_MS = 1000;
+    if (n <= 0) return 100;
+    const spent = Number.isFinite(took) ? Math.max(0, took) : 0;
+    if (spent >= HELD_MS) return 50;
+    const target = Math.min(2000, Math.round(1000 * 1.25 ** n));
+    return Math.max(50, Math.round(target - spent));
   }
 
   // A size as the browser's language writes it ("178.8 MB"); "" when unknown.
@@ -164,14 +174,33 @@
     return { name: String(c.label ?? "").slice(0, 200), size: sizeText(c.size, lang) };
   }
 
+  // Which of the app's qualities go in which tab: `choice.audio === true` is sound only, anything
+  // else (an app that doesn't say, an older one) is video. Tabs only when both kinds are there;
+  // otherwise one list (`all`) in the app's order. Every number is the quality's place in the
+  // app's own list (what a pick sends), never its place in a tab.
+  function groupChoices(choices, max) {
+    const list = Array.isArray(choices) ? choices.slice(0, Math.max(0, Number.isFinite(max) ? max : 100)) : [];
+    const video = [];
+    const audio = [];
+    list.forEach((c, i) => (c && typeof c === "object" && c.audio === true ? audio : video).push(i));
+    return {
+      tabbed: video.length > 0 && audio.length > 0,
+      video,
+      audio,
+      all: list.map((_, i) => i),
+      start: video.length || !audio.length ? "video" : "audio",
+    };
+  }
+
   // Follows a lookup the app is running, from its first answer: asks again only once the last
-  // question was answered (never on a timer of its own), pollDelay apart, until it is no longer
+  // question was answered (never on a timer of its own), pollDelay later, until it is no longer
   // pending (that answer, with its token), the minute is up ({state: "late"}) or it is no longer
   // wanted (null: the menu closed, the video or the page changed). `ask(token, ms)`: the
   // background's answer, or {late: true} after `ms`; `sleep(ms)` may end early when dropped.
   async function followLookup(first, { ask, alive, sleep, now, end }) {
     let s = first;
     let token = "";
+    let took = 0;
     for (let n = 0; ; n += 1) {
       if (!alive()) return null;
       if (!s || typeof s !== "object") return { state: "gone" };
@@ -180,10 +209,12 @@
       if (!token) return { state: "gone" };
       const left = end - now();
       if (left <= 0) return { state: "late" };
-      await sleep(Math.min(pollDelay(n), left));
+      await sleep(Math.min(pollDelay(n, took), left));
       if (!alive()) return null;
       if (end - now() <= 0) return { state: "late" };
-      const r = await ask(token, end - now());
+      const asked = now();
+      const r = await ask(token, end - asked);
+      took = now() - asked;
       if (!alive() || !r || r.gone) return null;
       if (r.late) return { state: "late" };
       // Another MDM chosen meanwhile: the window, as for a click.
@@ -345,6 +376,11 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
 .menu .pick { display: flex; align-items: baseline; gap: 16px; }
 .pick .name { overflow-wrap: anywhere; }
 .pick .size { margin-inline-start: auto; color: #4a6681; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* Video / Audio tabs over the rows, when the video has both. */
+.tabs { display: flex; gap: 4px; padding: 0 0 4px; }
+.tabs[hidden] { display: none; }
+.menu .tab { flex: 1 1 0; width: auto; text-align: center; font-weight: 600; color: #3b5876; border-radius: 6px 6px 0 0; border-bottom: 2px solid transparent; }
+.menu .tab[aria-selected="true"] { color: #17324d; border-bottom-color: #2a78d6; }
 .note { padding: 8px 12px; color: #3b5876; overflow-wrap: anywhere; }
 .note .why { display: block; margin-top: 4px; font-size: 12px; color: #5a7086; }
 @media (prefers-reduced-motion: reduce) { .pill { transition: none; transform: none; } }
@@ -379,11 +415,17 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
   <hr>
   <button role="menuitem" data-act="settings"></button>
 </div>
-<div class="menu picks" role="menu" tabindex="-1" aria-describedby="said">
+<div class="menu picks" role="group" tabindex="-1" aria-describedby="said">
   <div class="note" id="said" role="status"></div>
-  <div class="rows" role="none"></div>
+  <div class="tabs" role="tablist" hidden>
+    <button type="button" class="tab" role="tab" id="tab-video" aria-controls="qualities" data-tab="video"></button>
+    <button type="button" class="tab" role="tab" id="tab-audio" aria-controls="qualities" data-tab="audio"></button>
+  </div>
+  <div class="qualities" id="qualities" role="none">
+    <div class="rows" role="menu"></div>
+  </div>
   <hr>
-  <button role="menuitem" data-act="window"></button>
+  <button data-act="window"></button>
 </div>`;
   shadow.querySelector(".go img").src = LOGO;
   const pill = shadow.querySelector(".pill");
@@ -396,6 +438,9 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
   const picks = shadow.querySelector(".picks");
   const note = picks.querySelector(".note");
   const rows = picks.querySelector(".rows");
+  const tabs = picks.querySelector(".tabs");
+  const tabList = [...tabs.querySelectorAll("[data-tab]")];
+  const qualities = picks.querySelector(".qualities");
   const openRow = picks.querySelector('[data-act="window"]');
   // Which of the two menus is open (`menuOpen`).
   let panel = menu;
@@ -413,6 +458,10 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
   item("never").textContent = ext.i18n.getMessage("video_never_site", [host]) || `Never on ${host}`;
   item("settings").textContent = t("video_settings");
   picks.setAttribute("aria-label", idleLabel);
+  rows.setAttribute("aria-label", idleLabel);
+  tabs.setAttribute("aria-label", idleLabel);
+  tabs.dir = pill.dir;
+  for (const b of tabList) b.textContent = t(b.dataset.tab === "audio" ? "video_tab_audio" : "video_tab_video");
   openRow.textContent = t("video_open_mdm");
 
   // ---- which video ----------------------------------------------------------------------------
@@ -728,7 +777,7 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
     closeMenu();
     panel = picks;
     menuOpen = true;
-    rows.replaceChildren();
+    clearRows();
     said(t("video_looking"));
     picks.setAttribute("aria-busy", "true");
     picks.classList.add("open");
@@ -736,6 +785,14 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
     lastMove = Date.now();
     position();
     picks.focus({ preventScroll: true });
+  }
+
+  // No rows, no tabs.
+  function clearRows() {
+    rows.replaceChildren();
+    tabs.hidden = true;
+    qualities.setAttribute("role", "none");
+    qualities.removeAttribute("aria-labelledby");
   }
 
   // The menu's message (plain text), with the app's own words under it.
@@ -761,7 +818,7 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
   function say(j, text, detail) {
     if (!current(j)) return;
     picks.setAttribute("aria-busy", "false");
-    rows.replaceChildren();
+    clearRows();
     said(text, detail);
     position();
     if (focusHere()) openRow.focus();
@@ -782,13 +839,12 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
     return useWindow(j);
   }
 
-  // The qualities, a row each: the app's name for it and its size, as text.
-  function offer(j, s) {
-    j.count = Math.min(s.choices.length, 100);
-    j.token = s.token;
+  // The rows for these qualities of the app's list (their numbers), a row each: the app's name
+  // for it and its size, as text. The row keeps the quality's number in the app's list.
+  function showRows(s, numbers) {
     rows.replaceChildren(
-      ...s.choices.slice(0, j.count).map((choice, i) => {
-        const { name, size } = rowText(choice, lang);
+      ...numbers.map((i) => {
+        const { name, size } = rowText(s.choices[i], lang);
         const b = document.createElement("button");
         b.type = "button";
         b.className = "pick";
@@ -807,13 +863,43 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
         return b;
       }),
     );
+  }
+
+  // One of the two tabs shown: it is the selected one (the only one in the tab order), its
+  // qualities are the rows.
+  function showTab(j, s, kind) {
+    for (const b of tabList) {
+      const on = b.dataset.tab === kind;
+      b.setAttribute("aria-selected", String(on));
+      b.tabIndex = on ? 0 : -1;
+    }
+    qualities.setAttribute("aria-labelledby", `tab-${kind}`);
+    j.tab = kind;
+    showRows(s, j.groups[kind]);
+    position();
+  }
+
+  // The qualities: in one list, or in the Video and Audio tabs when there are both.
+  function offer(j, s) {
+    j.count = Math.min(s.choices.length, 100);
+    j.token = s.token;
+    j.groups = groupChoices(s.choices, j.count);
+    j.s = s;
+    if (j.groups.tabbed) {
+      tabs.hidden = false;
+      qualities.setAttribute("role", "tabpanel");
+      showTab(j, s, j.groups.start);
+    } else {
+      clearRows();
+      showRows(s, j.groups.all);
+    }
     said("");
     picks.setAttribute("aria-busy", "false");
     // Rows that just pushed "Open in…" down under the pointer aren't picked by a click meant for
     // it.
     j.armed = Date.now() + 300;
     position();
-    if (focusHere()) rows.firstElementChild.focus();
+    if (focusHere()) (rows.firstElementChild || openRow).focus();
   }
 
   // Asks how the lookup is going until it ends (followLookup), then shows what it came to.
@@ -880,6 +966,11 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
     const j = job;
     if (!j || !b) return;
     if (b.dataset.act === "window") return useWindow(j);
+    // A tab: its qualities are the rows now (the keyboard stays on the tab).
+    if (b.dataset.tab !== undefined) {
+      if (j.groups && j.groups.tabbed && j.groups[b.dataset.tab] && j.s) showTab(j, j.s, b.dataset.tab);
+      return;
+    }
     if (b.dataset.choice !== undefined) return pick(j, Number(b.dataset.choice));
   }
 
@@ -974,8 +1065,26 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
       else run(focused.dataset.act);
       e.preventDefault();
       e.stopPropagation();
+    } else if (menuOpen && panel === picks && !tabs.hidden && focused && focused.dataset.tab !== undefined && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) {
+      // Between the tabs (not on to the rows); the arrows follow the reading direction.
+      const i = tabList.indexOf(focused);
+      const step = (e.key === "ArrowRight") === (pill.dir !== "rtl") ? 1 : -1;
+      const next = e.key === "Home" ? 0 : e.key === "End" ? tabList.length - 1 : (i + step + tabList.length) % tabList.length;
+      tabList[next].focus();
+      e.preventDefault();
+      e.stopPropagation();
+    } else if (menuOpen && panel === picks && !tabs.hidden && focused && (e.key === "ArrowDown" || e.key === "ArrowUp") && (focused.dataset.tab !== undefined || (e.key === "ArrowUp" && focused === rows.firstElementChild))) {
+      // From a tab down to the rows; up from the first row to the selected tab.
+      if (focused.dataset.tab !== undefined) {
+        if (e.key === "ArrowDown") (rows.firstElementChild || openRow).focus();
+      } else {
+        (tabList.find((b) => b.tabIndex === 0) || tabList[0]).focus();
+      }
+      e.preventDefault();
+      e.stopPropagation();
     } else if (menuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
-      const items = [...panel.querySelectorAll("button")];
+      // The rows (and "Open in…"), never the tabs.
+      const items = [...panel.querySelectorAll("button:not([data-tab])")];
       const i = items.indexOf(focused);
       const down = e.key === "ArrowDown";
       // From the menu itself (the qualities' while it looks): the first, or the last.

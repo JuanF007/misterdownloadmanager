@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "Vyhledání se nezdařilo"
   },
+  "video_tab_video": {
+    "message": "Video"
+  },
+  "video_tab_audio": {
+    "message": "Zvuk"
+  },
   "popup_send_to": {
     "message": "Odeslat stahování do"
   },

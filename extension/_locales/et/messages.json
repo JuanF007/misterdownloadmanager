@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "Otsimine ebaõnnestus"
   },
+  "video_tab_video": {
+    "message": "Video"
+  },
+  "video_tab_audio": {
+    "message": "Heli"
+  },
   "popup_send_to": {
     "message": "Saada allalaadimised asukohta"
   },

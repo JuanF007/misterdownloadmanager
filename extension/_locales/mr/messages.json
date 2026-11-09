@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "शोधता आले नाही"
   },
+  "video_tab_video": {
+    "message": "व्हिडिओ"
+  },
+  "video_tab_audio": {
+    "message": "ऑडिओ"
+  },
   "popup_send_to": {
     "message": "डाउनलोड्स येथे पाठवा"
   },

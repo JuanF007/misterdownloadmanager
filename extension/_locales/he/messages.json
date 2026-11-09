@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "החיפוש נכשל"
   },
+  "video_tab_video": {
+    "message": "וידאו"
+  },
+  "video_tab_audio": {
+    "message": "שמע"
+  },
   "popup_send_to": {
     "message": "שלח הורדות אל"
   },

@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "Iskanje ni uspelo"
   },
+  "video_tab_video": {
+    "message": "Video"
+  },
+  "video_tab_audio": {
+    "message": "Zvok"
+  },
   "popup_send_to": {
     "message": "Pošlji prenose v"
   },

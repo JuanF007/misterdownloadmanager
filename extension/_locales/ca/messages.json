@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "No s'ha pogut consultar"
   },
+  "video_tab_video": {
+    "message": "Vídeo"
+  },
+  "video_tab_audio": {
+    "message": "Àudio"
+  },
   "popup_send_to": {
     "message": "Enviar baixades a"
   },

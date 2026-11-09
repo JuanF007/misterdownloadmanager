@@ -17,7 +17,8 @@
 //!   the video up, `{"videoPoll": {token}}` asks how it goes, `{"videoPick": {token, choice,
 //!   storeId}}` downloads the choice made. Each is answered `{"ok": true, "lookup": {state, …}}`
 //!   (`mdm_ipc::api::VideoLookupAnswer`), never with a `why`; none of them starts the app
-//!   (`use-window`: the button's click then opens the Download video window as before).
+//!   (`use-window`: the button's click then opens the Download video window as before). A
+//!   question waits here while the look-up runs, up to 1.5 s ([`POLL_WAIT`]).
 //! - `misterdownloadmanager-nmhost --register` / `--unregister`: writes / removes the host
 //!   manifests (Chromium's names the extension's origin, Firefox's its add-on ID). Windows: beside
 //!   this exe, with the per-user (HKCU) registry entries the browsers look up; with `--all-users`
@@ -628,11 +629,39 @@ fn quality_menu(
         win32::allow_foreground(pid);
     }
     let token = cmd.video_poll.clone().unwrap_or_default();
-    let answer = menu_answer(ask, mdm_ipc::request_checked(&cmd), &token);
+    let ask_app = || menu_answer(ask, mdm_ipc::request_checked(&cmd), &token);
+    let answer = match ask {
+        MenuAsk::Poll => until_settled(ask_app, POLL_WAIT, POLL_EVERY),
+        MenuAsk::Lookup | MenuAsk::Pick => ask_app(),
+    };
     if let Some(l) = &cmd.video_lookup {
         log_line(&lookup_line(browser, &l.address, m.private, &answer.state));
     }
     Reply::lookup(answer)
+}
+
+/// How long a question about a look-up waits here while it runs, asking the app again every
+/// [`POLL_EVERY`]: the browser then asks about once every 1.5 s while yt-dlp works (a host
+/// started for each question), and hears of the answer within a tenth of a second of it.
+const POLL_WAIT: Duration = Duration::from_millis(1500);
+const POLL_EVERY: Duration = Duration::from_millis(100);
+
+/// `ask`'s answer once it is no longer `pending`, asked again every `every`, for `wait` at most
+/// (then `pending` as it is).
+fn until_settled(
+    mut ask: impl FnMut() -> mdm_ipc::api::VideoLookupAnswer,
+    wait: Duration,
+    every: Duration,
+) -> mdm_ipc::api::VideoLookupAnswer {
+    let end = std::time::Instant::now() + wait;
+    loop {
+        let answer = ask();
+        if answer.state != mdm_ipc::api::lookup::PENDING || std::time::Instant::now() + every > end
+        {
+            return answer;
+        }
+        std::thread::sleep(every);
+    }
 }
 
 /// The app's answer to the quality menu's `ask` (`token`: the look-up a question is about), or
@@ -1815,6 +1844,64 @@ mod tests {
             serde_json::to_string(&Reply::lookup(menu_answer(MenuAsk::Lookup, line("ok"), "")))
                 .unwrap();
         assert_eq!(json, r#"{"ok":true,"lookup":{"state":"use-window"}}"#);
+    }
+
+    /// A question waits while the look-up runs, asking the app every 100 ms, and answers as soon
+    /// as it is ready, or `pending` after 1.5 s; whether a choice is sound alone reaches the
+    /// browser as the app says it.
+    #[test]
+    fn a_question_waits_for_the_look_up() {
+        use mdm_ipc::SendError;
+        use mdm_ipc::api::lookup;
+        let ready = r#"{"state":"ready","token":"t1","title":"A talk","choices":[{"label":"720p MP4","ext":"mp4","size":null,"audio":false},{"label":"Audio only MP3 320 kbps","ext":"mp3","size":null,"audio":true}]}"#;
+        let mut asked = 0;
+        let start = std::time::Instant::now();
+        let answer = until_settled(
+            || {
+                asked += 1;
+                let got = if asked < 3 {
+                    r#"{"state":"pending","token":"t1"}"#
+                } else {
+                    ready
+                };
+                menu_answer(MenuAsk::Poll, Ok::<String, SendError>(got.into()), "t1")
+            },
+            POLL_WAIT,
+            Duration::from_millis(20),
+        );
+        assert_eq!((answer.state.as_str(), asked), (lookup::READY, 3));
+        assert!(start.elapsed() < Duration::from_millis(500));
+        let json = serde_json::to_string(&Reply::lookup(answer)).unwrap();
+        assert!(
+            json.contains(r#""ext":"mp4","size":null,"audio":false"#)
+                && json.contains(r#""ext":"mp3","size":null,"audio":true"#),
+            "{json}"
+        );
+        // Still running after the wait: `pending`, having asked every tenth of a second.
+        let mut asked = 0;
+        let start = std::time::Instant::now();
+        let answer = until_settled(
+            || {
+                asked += 1;
+                mdm_ipc::api::VideoLookupAnswer::pending("t1")
+            },
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+        );
+        assert_eq!(answer.state, lookup::PENDING);
+        assert!((3..=4).contains(&asked), "{asked}");
+        assert!(start.elapsed() < Duration::from_millis(600));
+        // Anything else at once.
+        let mut asked = 0;
+        let gone = until_settled(
+            || {
+                asked += 1;
+                mdm_ipc::api::VideoLookupAnswer::of(lookup::GONE)
+            },
+            POLL_WAIT,
+            POLL_EVERY,
+        );
+        assert_eq!((gone.state.as_str(), asked), (lookup::GONE, 1));
     }
 
     #[test]

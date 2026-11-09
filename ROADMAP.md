@@ -493,8 +493,14 @@ These ship in a later version, when they're ready.
   ([#392](https://github.com/anefzaoui/misterdownloadmanager/issues/392)): in review
 - 🔄 Help: when an antivirus or VirusTotal flags MDM
 - 🔄 The Download video button lists the video's qualities, with their sizes, in a menu on the
-  page: the one picked downloads at once with only its progress window, MDM's main window staying
-  where it is; "Open in Mister Download Manager…" keeps the Download video window: in review
+  page, video and audio in their own tabs: the one picked downloads at once with only its progress
+  window, MDM's main window staying where it is; "Open in Mister Download Manager…" keeps the
+  Download video window. A stream the page plays (HLS) is listed at once, read by MDM itself; the
+  same video asked again within 10 minutes opens at once; the pick starts without looking the
+  video up a second time: in review
+- 🔄 Picking a video quality already in the list (the menu over a video, the Download video window)
+  follows Options' duplicate setting instead of downloading it again: in review
+- 🔄 The progress window's bar glides instead of moving in steps: in review
 - 🔄 Linux, what's left ([#164](https://github.com/anefzaoui/misterdownloadmanager/issues/164)):
   screen readers (Orca) reading MDM's windows; browsers installed as a Flatpak (Firefox from
   Flathub may reach MDM through the desktop, as the Snap does: to check); native Wayland windows

@@ -118,6 +118,25 @@ fn tracks(raw: Option<std::collections::BTreeMap<String, Vec<RawSub>>>) -> Vec<T
     out
 }
 
+/// Subtitle languages that come without names, as yt-dlp lists an HLS stream's (`de`, `und`):
+/// what [`tracks`] makes of them (`crate::manifest`).
+pub(crate) fn unnamed_tracks(codes: impl IntoIterator<Item = String>) -> Vec<Track> {
+    tracks(Some(
+        codes
+            .into_iter()
+            .map(|code| (code, vec![RawSub { name: None }]))
+            .collect(),
+    ))
+}
+
+/// The size of `duration` seconds at `tbr` kbit/s (kbit/s × 125 = bytes/s), as yt-dlp's
+/// `filesize_from_tbr` reckons it: the same operations in the same order, so a stream's variants
+/// come out the same whether yt-dlp listed them or MDM read the stream itself
+/// (`crate::manifest`).
+pub(crate) fn estimate(duration: f64, tbr: f64) -> u64 {
+    (duration * tbr * 125.0) as u64
+}
+
 #[derive(Deserialize)]
 struct RawFormat {
     format_id: String,
@@ -160,7 +179,7 @@ pub fn parse(json: &[u8]) -> Option<Video> {
         .filter(|d| d.is_finite() && *d > 0.0 && !raw.direct);
     let estimate = |tbr: Option<f64>| {
         let tbr = tbr.filter(|t| t.is_finite() && *t > 0.0)?;
-        Some((duration? * tbr * 125.0) as u64)
+        Some(estimate(duration?, tbr))
     };
     Some(Video {
         title: raw.title.unwrap_or_else(|| "video".into()),
@@ -273,11 +292,25 @@ pub fn parse_looked(json: &[u8]) -> Option<Looked> {
     parse(json).map(Looked::Video)
 }
 
+/// How long one yt-dlp look-up may take. `proc::look_up` may run it twice (the second time
+/// without the cookies, #352).
+pub const LOOK_UP_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Look `url` up with yt-dlp: one video (`--no-playlist`: a video in a playlist is that video),
 /// or, for a page that is a list, only what it is and its first entry, flat (#69: never every
 /// video of a 6,000-long playlist at once; `--flat-playlist -I 1:1` doesn't change a video's
 /// look-up).
 pub fn look_up(exe: &Path, url: &str, browser: &proc::FromBrowser) -> Result<Looked, ProcError> {
+    look_up_kept(exe, url, browser).map(|(looked, _)| looked)
+}
+
+/// [`look_up`], with yt-dlp's answer as it gave it: the browser's quality menu keeps it for the
+/// download chosen there, which then doesn't read the page again (`video::Preloaded`).
+pub fn look_up_kept(
+    exe: &Path,
+    url: &str,
+    browser: &proc::FromBrowser,
+) -> Result<(Looked, proc::LookedUp), ProcError> {
     let mut args: Vec<String> = [
         "-J",
         "--no-playlist",
@@ -291,11 +324,12 @@ pub fn look_up(exe: &Path, url: &str, browser: &proc::FromBrowser) -> Result<Loo
     // Kept until yt-dlp has answered.
     let (theirs, _cookies) = browser.args(url)?;
     args.extend(theirs);
-    let out = proc::look_up(exe, &args, url, Duration::from_secs(90))?;
-    parse_looked(&out.json).ok_or_else(|| ProcError::Failed {
+    let out = proc::look_up(exe, &args, url, LOOK_UP_TIMEOUT)?;
+    let looked = parse_looked(&out.json).ok_or_else(|| ProcError::Failed {
         tool: "yt-dlp".into(),
         message: "it gave no video information".into(),
-    })
+    })?;
+    Ok((looked, out))
 }
 
 /// Look `url` up as one video (a list is an error here).

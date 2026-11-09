@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "Não foi possível pesquisar"
   },
+  "video_tab_video": {
+    "message": "Vídeo"
+  },
+  "video_tab_audio": {
+    "message": "Áudio"
+  },
   "popup_send_to": {
     "message": "Enviar downloads para"
   },

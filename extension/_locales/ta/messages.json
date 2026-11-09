@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "தேட முடியவில்லை"
   },
+  "video_tab_video": {
+    "message": "வீடியோ"
+  },
+  "video_tab_audio": {
+    "message": "ஆடியோ"
+  },
   "popup_send_to": {
     "message": "பதிவிறக்கங்களை இதற்கு அனுப்பவும்"
   },

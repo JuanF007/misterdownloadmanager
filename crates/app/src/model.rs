@@ -412,6 +412,10 @@ pub struct Item {
     /// #68), in the interface language; memory only.
     #[serde(skip)]
     pub notices: Vec<String>,
+    /// A video chosen in the browser's quality menu: the menu's look-up, for its first run only
+    /// (taken then); memory only, never written (its links are signed).
+    #[serde(skip)]
+    pub preloaded: Option<mdm_tools::video::Preloaded>,
 }
 
 /// A Link grabber package, as each of its downloads keeps it (#37).
@@ -702,6 +706,7 @@ impl Item {
             login: None,
             context: Default::default(),
             notices: Vec::new(),
+            preloaded: None,
         }
     }
     /// This row's resume state is at its place. `downloaded` can't say: after a crash the list

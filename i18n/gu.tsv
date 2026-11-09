@@ -5569,6 +5569,10 @@ extension	Added to the queue	કતારમાં ઉમેર્યું
 #, machine
 extension	Another Mister Download Manager (a server)	બીજું Mister Download Manager (એક સર્વર)
 #. text in the browser extension
+#. tab above the list of qualities in the menu under the download button over a video: the choices that are sound only (MP3, Opus and the like); short, one word
+#, machine
+extension	Audio	ઑડિઓ
+#. text in the browser extension
 #. the name this browser gets in the other MDM's list of paired devices
 #, machine
 extension	Browser extension	બ્રાઉઝર એક્સ્ટેંશન
@@ -5867,6 +5871,10 @@ extension	Update Mister Download Manager to use everything this extension offers
 #. why a download stayed with the browser: the app's setting 'Use advanced browser integration' is off; keep the setting's name as the app shows it
 #, machine
 extension	Use advanced browser integration is off in Options → General.	વિકલ્પો → સામાન્યમાં અદ્યતન બ્રાઉઝર એકીકરણનો ઉપયોગ કરો બંધ છે.
+#. text in the browser extension
+#. tab above the list of qualities in the menu under the download button over a video: the choices that include picture (video with sound); short, one word
+#, machine
+extension	Video	વિડિઓ
 #. text in the browser extension
 #. pairing failed: codes tried too fast
 #, machine

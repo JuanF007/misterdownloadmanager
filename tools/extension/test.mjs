@@ -1390,12 +1390,36 @@ const MPD = (protect) => `<?xml version="1.0"?>
     throw new Error(`${name}: no end`);
   };
   const make = (names, value) => new Function(`${names.map(fn).join("\n")}\nreturn ${value};`)();
-  // 1 s, then longer, 2 s at most.
+  // 100 ms before the first question, then the old backoff's target (1 s x 1.25^n, 2 s at most)
+  // less what the last answer took (50 ms at least): an older app (60 ms) is asked as seldom as
+  // before, a newer one (holding the answer ~1.5 s) is asked again almost at once early on.
   const pollDelay = make(["pollDelay"], "pollDelay");
-  const delays = Array.from({ length: 10 }, (_, n) => pollDelay(n));
-  assert.equal(delays[0], 1000);
-  assert.ok(delays.every((d, i) => d >= 1000 && d <= 2000 && (i === 0 || d >= delays[i - 1])), `${delays}`);
-  assert.equal(delays.at(-1), 2000);
+  assert.equal(pollDelay(0, 0), 100);
+  assert.equal(pollDelay(0, 5000), 100);
+  assert.equal(pollDelay(1, 60), 1190);
+  assert.equal(pollDelay(1, 1500), 50);
+  assert.equal(pollDelay(2, 1500), 50);
+  assert.equal(pollDelay(2, 999), 564);
+  assert.equal(pollDelay(9, 0), 2000);
+  assert.equal(pollDelay(9, 1500), 50);
+  assert.equal(pollDelay(9, 99999), 50);
+  assert.equal(pollDelay(3, undefined), 1953);
+  assert.equal(pollDelay(3, NaN), 1953);
+  assert.equal(pollDelay(3, -20), 1953);
+  // The qualities in tabs: sound-only ones apart when the video has both kinds; else one list. Every
+  // number is the place in the app's list.
+  const groupChoices = make(["groupChoices"], "groupChoices");
+  const grp = (list, max) => JSON.parse(JSON.stringify(groupChoices(list, max)));
+  const mixed = [{ audio: false }, { audio: false }, { audio: true }, { audio: false }, { audio: true }];
+  assert.deepEqual(grp(mixed), { tabbed: true, video: [0, 1, 3], audio: [2, 4], all: [0, 1, 2, 3, 4], start: "video" });
+  assert.deepEqual(grp([{ audio: true }, { audio: false }]), { tabbed: true, video: [1], audio: [0], all: [0, 1], start: "video" });
+  assert.deepEqual(grp([{ label: "720p" }, { label: "360p" }]), { tabbed: false, video: [0, 1], audio: [], all: [0, 1], start: "video" }, "an older app: no audio flag, one list");
+  assert.equal(grp([{ audio: "yes" }, { audio: 1 }, null, "x"]).tabbed, false, "only true counts as audio");
+  assert.deepEqual(grp([{ audio: true }, { audio: true }]), { tabbed: false, video: [], audio: [0, 1], all: [0, 1], start: "audio" }, "only audio: one list");
+  assert.deepEqual(grp([{ audio: false }, { audio: false }]), { tabbed: false, video: [0, 1], audio: [], all: [0, 1], start: "video" }, "only video: one list");
+  assert.deepEqual(grp([]), { tabbed: false, video: [], audio: [], all: [], start: "video" });
+  assert.deepEqual(grp(undefined), { tabbed: false, video: [], audio: [], all: [], start: "video" });
+  assert.deepEqual(grp(mixed, 3), { tabbed: true, video: [0, 1], audio: [2], all: [0, 1, 2], start: "video" }, "the cap keeps the app's order");
   // A row: the app's name for the quality as it is (set as text), its size in the browser's language.
   const { sizeText, rowText } = make(["sizeText", "rowText"], "{ sizeText, rowText }");
   assert.equal(sizeText(187500000, "en"), "178.8 MB");
@@ -1406,7 +1430,7 @@ const MPD = (protect) => `<?xml version="1.0"?>
   assert.deepEqual({ ...rowText(null, "en") }, { name: "", size: "" });
   // Following a lookup: the next question only after the last answer, on a clock of its own here.
   const followLookup = make(["pollDelay", "followLookup"], "followLookup");
-  const follow = async (first, answers, { alive = () => true } = {}) => {
+  const follow = async (first, answers, { alive = () => true, took = 0 } = {}) => {
     let clock = 0;
     let open = 0;
     const asked = [];
@@ -1415,6 +1439,7 @@ const MPD = (protect) => `<?xml version="1.0"?>
         assert.equal(open++, 0, "one question at a time");
         asked.push({ token, at: clock, ms });
         await Promise.resolve();
+        clock += took;
         open -= 1;
         return answers.length ? answers.shift() : { lookup: { state: "pending" } };
       },
@@ -1431,13 +1456,53 @@ const MPD = (protect) => `<?xml version="1.0"?>
   const ready = { state: "ready", token: "t1", choices: [{ label: "720p MP4", ext: "mp4", size: 1 }] };
   let f = await follow(pending, [{ lookup: pending }, { lookup: ready }]);
   assert.deepEqual(f.result, ready);
-  assert.deepEqual(f.asked.map((a) => [a.token, a.at]), [["t1", 1000], ["t1", 2250]], "1 s, then a little longer");
+  assert.deepEqual(f.asked.map((a) => [a.token, a.at]), [["t1", 100], ["t1", 1350]], "100 ms, then the old backoff (an app that answers at once)");
   // Still looking after a minute: given up then, never asked after it.
   f = await follow(pending, []);
   assert.deepEqual(f.result, { state: "late" });
   assert.equal(f.clock, 60000);
   assert.ok(f.asked.every((a) => a.at < 60000 && a.ms > 0 && a.token === "t1"), "the token from the first answer");
-  assert.ok(f.asked.length > 25 && f.asked.length < 40, `${f.asked.length} questions in a minute`);
+  // An older app (answers in ~60 ms): no more questions than the old schedule (1 s x 1.25^n, 2 s at
+  // most: asks at 1 s, 2.25 s, ...) made in a minute.
+  let old = 0;
+  for (let at = 0, n = 0; (at += Math.min(2000, 1000 * 1.25 ** n)) < 60000; n += 1) old += 1;
+  f = await follow(pending, [], { took: 60 });
+  assert.deepEqual(f.result, { state: "late" });
+  assert.equal(f.asked[0].at, 100);
+  assert.ok(f.asked.length <= old, `old host: ${f.asked.length} questions in a minute, the old schedule's ${old}`);
+  // A newer app (holds the answer ~1.5 s while it looks): one at a time, asked again almost at once
+  // early on, and the answer reaches the page soon after it is ready. A host that is ready at `r`
+  // answers its question in flight 100 ms later (else after 1.5 s).
+  const latency = async (r) => {
+    let clock = 0;
+    let done = null;
+    let ready = { state: "ready", token: "t1", choices: [] };
+    const res = await followLookup(pending, {
+      ask: async () => {
+        const start = clock;
+        const end = Math.min(start + 1500, Math.max(start, r) + 100);
+        clock = end;
+        return { lookup: end >= r ? ((done = end), ready) : pending };
+      },
+      alive: () => true,
+      sleep: async (ms) => {
+        clock += ms;
+      },
+      now: () => clock,
+      end: 60000,
+    });
+    assert.equal(res.state, "ready");
+    return done - r;
+  };
+  for (const r of [0, 300, 1000, 1700, 2500, 3000]) assert.ok((await latency(r)) <= (r ? 150 : 250), `new host, ready at ${r} ms: answered ${await latency(r)} ms later`);
+  for (const r of [5000, 12000, 30000]) assert.ok((await latency(r)) <= 150, `new host, ready at ${r} ms: answered ${await latency(r)} ms later`);
+  f = await follow(pending, [], { took: 1500 });
+  assert.deepEqual(f.result, { state: "late" });
+  assert.ok(f.asked.length > 20 && f.asked.length <= 40, `new host: ${f.asked.length} questions in a minute`);
+  // In between (an answer after 600 ms): the rest of the second.
+  f = await follow(pending, [{ lookup: pending }, { lookup: pending }, { lookup: ready }], { took: 600 });
+  assert.deepEqual(f.asked.map((a) => a.at), [100, 1350, 2913]);
+  assert.deepEqual(f.result, ready);
   // Dropped (the menu closed, the video or the page changed): nothing more, no answer shown.
   f = await follow(pending, [{ lookup: pending }, { lookup: ready }], { alive: (asked) => asked.length < 1 });
   assert.deepEqual([f.result, f.asked.length], [null, 1]);
@@ -1520,7 +1585,7 @@ const MPD = (protect) => `<?xml version="1.0"?>
   // The page's own controls: a key the open menu used doesn't reach the page, and the button (and
   // so its menu) stays where it is while the menu is open.
   const keys = source.slice(source.indexOf('shadow.addEventListener("keydown"'), source.indexOf("// The main part: a click downloads"));
-  assert.equal(keys.match(/e\.stopPropagation\(\)/g).length, 3, "Escape, Enter and Space, the arrows: not the page's too");
+  assert.equal(keys.match(/e\.stopPropagation\(\)/g).length, 5, "Escape, Enter and Space, the tabs' arrows, between tabs and rows, the rows' arrows: not the page's too");
   assert.ok(fn("spot").includes("if (menuOpen && auto.v === video && auto.at) return auto.at;"), "spot: still while its menu is open");
   assert.equal(source.match(/innerHTML/g).length, 1, "markup only for the fixed parts");
   assert.ok(!/insertAdjacentHTML|outerHTML|setInterval/.test(source));

@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "A keresés sikertelen"
   },
+  "video_tab_video": {
+    "message": "Videó"
+  },
+  "video_tab_audio": {
+    "message": "Hang"
+  },
   "popup_send_to": {
     "message": "Letöltések küldése ide"
   },

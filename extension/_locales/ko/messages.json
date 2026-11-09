@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "찾지 못했습니다"
   },
+  "video_tab_video": {
+    "message": "비디오"
+  },
+  "video_tab_audio": {
+    "message": "오디오"
+  },
   "popup_send_to": {
     "message": "다운로드 보낼 위치"
   },

@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "Hakeminen epäonnistui"
   },
+  "video_tab_video": {
+    "message": "Video"
+  },
+  "video_tab_audio": {
+    "message": "Ääni"
+  },
   "popup_send_to": {
     "message": "Lähetä lataukset kohteeseen"
   },

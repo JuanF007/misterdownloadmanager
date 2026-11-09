@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "খোঁজা যায়নি"
   },
+  "video_tab_video": {
+    "message": "ভিডিও"
+  },
+  "video_tab_audio": {
+    "message": "অডিও"
+  },
   "popup_send_to": {
     "message": "ডাউনলোডগুলি এখানে পাঠান"
   },

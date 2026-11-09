@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "መፈለግ አልተቻለም"
   },
+  "video_tab_video": {
+    "message": "ቪዲዮ"
+  },
+  "video_tab_audio": {
+    "message": "ኦዲዮ"
+  },
   "popup_send_to": {
     "message": "ውርዶችን ወደ"
   },

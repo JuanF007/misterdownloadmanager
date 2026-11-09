@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "खोज नहीं हो सकी"
   },
+  "video_tab_video": {
+    "message": "वीडियो"
+  },
+  "video_tab_audio": {
+    "message": "ऑडियो"
+  },
   "popup_send_to": {
     "message": "डाउनलोड यहां भेजें"
   },

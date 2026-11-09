@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "Търсенето не успя"
   },
+  "video_tab_video": {
+    "message": "Видео"
+  },
+  "video_tab_audio": {
+    "message": "Аудио"
+  },
   "popup_send_to": {
     "message": "Изпращане на изтегляния до"
   },

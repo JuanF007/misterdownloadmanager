@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "వెతకడం సాధ్యం కాలేదు"
   },
+  "video_tab_video": {
+    "message": "వీడియో"
+  },
+  "video_tab_audio": {
+    "message": "ఆడియో"
+  },
   "popup_send_to": {
     "message": "డౌన్‌లోడ్‌లను దీనికి పంపండి"
   },

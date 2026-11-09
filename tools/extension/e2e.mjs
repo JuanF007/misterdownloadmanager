@@ -31,6 +31,11 @@
 // remote (Send downloads to → Another MDM, #157: paired from the popup, a link downloaded by a
 // headless MDM; E2E_REMOTE_URL for one running elsewhere, such as the Docker image: remoteServer).
 //
+// Screenshots for a pull request (Chromium only): E2E_LANG=de (or ar, ...) starts the browser in that
+// language, so the extension shows its _locales text of it; with E2E_SHOTS=<folder> the `qualities`
+// case saves <lang>-looking.png, <lang>-video-tab.png and <lang>-audio-tab.png there (the player and
+// the menu), before the pick. Neither changes anything when unset.
+//
 // Windows: the host is registered for the current user while it runs (nmhost --register, as the
 // installer does) and unregistered at the end. Every registry key that touches (the browsers'
 // host entries and Chrome's external extension, per user and for everyone) is exported first
@@ -199,7 +204,8 @@ const PILL_STYLE = `function () {
 }`;
 
 // The qualities' menu the button's click opens (video.js), in the same closed shadow root: null
-// while closed; else whether it is still looking, its message, its rows (name, size) and "Open
+// while closed; else whether it is still looking, its message, its tabs (none when the video has one
+// kind of quality only: name, selected), its rows (name, size; the selected tab's) and "Open
 // in…", each with its middle on the page (where a click lands). `reveal` ("row": the first row,
 // "open": "Open in…") scrolls that into the menu's view first (the menu scrolls past 300 px).
 const PICKS = (reveal = "") => `function () {
@@ -210,9 +216,12 @@ const PICKS = (reveal = "") => `function () {
   if (shown) shown.scrollIntoView({ block: "nearest" });
   const at = (e) => { const r = e.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; };
   const note = m.querySelector(".note");
+  const box = m.getBoundingClientRect();
   return JSON.stringify({
+    box: { l: box.left, t: box.top, r: box.right, b: box.bottom },
     busy: m.getAttribute("aria-busy") === "true",
     note: note.hidden ? "" : note.textContent,
+    tabs: m.querySelector(".tabs").hidden ? [] : [...m.querySelectorAll(".tabs [data-tab]")].map((b) => ({ tab: b.dataset.tab, name: b.textContent, selected: b.getAttribute("aria-selected") === "true", ...at(b) })),
     rows: [...m.querySelectorAll(".rows .pick")].map((b) => ({ name: b.querySelector(".name").textContent, size: (b.querySelector(".size") || {}).textContent || "", ...at(b) })),
     open: { text: open.textContent, ...at(open) },
   });
@@ -229,7 +238,10 @@ async function chromium(bin, profile, dl, page, ready) {
   fs.mkdirSync(path.join(profile, "Default"), { recursive: true });
   fs.writeFileSync(
     path.join(profile, "Default", "Preferences"),
-    JSON.stringify({ download: { default_directory: dl, prompt_for_download: false, directory_upgrade: true } }),
+    JSON.stringify({
+      download: { default_directory: dl, prompt_for_download: false, directory_upgrade: true },
+      ...(process.env.E2E_LANG ? { intl: { accept_languages: process.env.E2E_LANG } } : {}),
+    }),
   );
   const proc = spawn(
     bin,
@@ -241,6 +253,7 @@ async function chromium(bin, profile, dl, page, ready) {
       "--no-first-run",
       "--no-default-browser-check",
       "--window-size=1280,900",
+      ...(process.env.E2E_LANG ? [`--lang=${process.env.E2E_LANG}`] : []),
       // The remote case's server has its own certificate (in real use the popup's "Open it" lets
       // the person accept it once); the lab's pages are plain http.
       "--ignore-certificate-errors",
@@ -324,6 +337,15 @@ async function chromium(bin, profile, dl, page, ready) {
         await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...at, buttons: 0, clickCount: 1 }, sessionId);
       }
     };
+    // A PNG of a page rectangle (CSS pixels, the device's own pixel ratio) in `file`.
+    const shot = async (file, box) => {
+      const x = Math.max(0, Math.floor(box.l));
+      const y = Math.max(0, Math.floor(box.t));
+      const clip = { x, y, width: Math.ceil(box.r) - x, height: Math.ceil(box.b) - y, scale: 1 };
+      const { data } = await cdp.send("Page.captureScreenshot", { format: "png", clip }, sessionId);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, Buffer.from(data, "base64"));
+    };
     const KEYS = { ArrowDown: 40, ArrowUp: 38, Enter: 13 };
     const key = async (k) => {
       for (const type of ["keyDown", "keyUp"]) {
@@ -376,6 +398,7 @@ async function chromium(bin, profile, dl, page, ready) {
       },
       navigate,
       key,
+      shot,
       pill,
       picks,
       tab,
@@ -1908,16 +1931,32 @@ const CASES = {
       const before = new Set((await mdmList()).map((d) => d.id));
       // What the page's own shortcuts would see (a player's Space and arrows).
       await t.session.evaluate('window.__mdmKeys = 0; document.addEventListener("keydown", () => { window.__mdmKeys += 1; }); 0');
-      await t.session.mouse(b.l + 14, (b.t + b.b) / 2, "click");
+      // The button's main part is at its start: on the right in a right-to-left language (E2E_LANG).
+      const rtl = /^(ar|he|fa|ur)\b/i.test(process.env.E2E_LANG || "");
+      await t.session.mouse(rtl ? b.r - 14 : b.l + 14, (b.t + b.b) / 2, "click");
+      const clicked = Date.now();
+      // Pictures for a pull request (E2E_SHOTS, see the top): the player and the menu together.
+      const shots = process.env.E2E_SHOTS && t.session.shot ? path.resolve(process.env.E2E_SHOTS) : "";
+      const lang = process.env.E2E_LANG || "en";
+      const snap = (name, p) => {
+        const box = { l: Math.min(v.l, p.box.l) - 10, t: Math.min(v.t, p.box.t) - 10, r: Math.max(v.r, p.box.r) + 10, b: Math.max(v.b, p.box.b) + 10 };
+        return t.session.shot(path.join(shots, `${lang}-${name}.png`), box);
+      };
+      let shotLooking = false;
       // The menu, looking, then the qualities MDM found.
       let looked = false;
       const m = await until("the qualities in the menu", 60000, async () => {
         if (appWindows(pid).includes(VIDEO_WINDOW)) throw new Error("the click opened the Download video window, not the menu");
         const p = await t.session.picks("row");
         looked ||= Boolean(p && p.busy);
+        if (shots && p && p.busy && !shotLooking) {
+          shotLooking = true;
+          await snap("looking", p);
+        }
         if (p && !p.busy && !p.rows.length) throw new Error(`the menu shows no qualities: "${p.note}"`);
         return p && p.rows.length ? p : null;
       });
+      const rowsMs = Date.now() - clicked;
       if (!m.rows.some((r) => r.size)) throw new Error(`no row has a size: ${JSON.stringify(m.rows.map((r) => [r.name, r.size]))}`);
       if (!m.open.text) throw new Error("no \"Open in…\" under the qualities");
       // The arrows move through the menu, and the page's shortcuts don't hear them.
@@ -1925,22 +1964,49 @@ const CASES = {
       await t.session.key("ArrowUp");
       const heard = await t.session.evaluate("window.__mdmKeys");
       if (heard !== 0) throw new Error(`the page heard ${heard} keys the menu used`);
+      // Video and Audio tabs (the ffmpeg gives MP3, Opus and FLAC rows beside the picture's): the
+      // Video one first, each listing only its kind.
+      const tabNames = m.tabs.map((x) => x.tab).join(",");
+      if (tabNames !== "video,audio") throw new Error(`the tabs are "${tabNames}", not video,audio: ${JSON.stringify(m.tabs.map((x) => x.name))}`);
+      if (m.tabs.some((x) => !x.name)) throw new Error("a tab has no text");
+      if (!m.tabs[0].selected || m.tabs[1].selected) throw new Error("the Video tab isn't the one shown first");
+      const picture = /\b\d{3,4}p\b/;
+      if (m.rows.some((r) => !picture.test(r.name))) throw new Error(`the Video tab lists a sound: ${JSON.stringify(m.rows.map((r) => r.name))}`);
       // Rows that just came take no click in their first 300 ms (video.js).
       await sleep(500);
-      const row = (await t.session.picks("row")).rows[0];
+      if (shots) await snap("video-tab", await t.session.picks());
+      const tab = async (kind) => {
+        const now = await t.session.picks("row");
+        const x = now.tabs.find((y) => y.tab === kind);
+        await t.session.mouse(x.x, x.y, "click");
+        return until(`the ${kind} tab's qualities`, 5000, async () => {
+          const p = await t.session.picks("row");
+          return p && p.tabs.find((y) => y.tab === kind)?.selected && p.rows.length ? p : null;
+        });
+      };
+      const sounds = await tab("audio");
+      if (shots) await snap("audio-tab", await t.session.picks());
+      if (sounds.rows.some((r) => picture.test(r.name))) throw new Error(`the Audio tab lists a picture: ${JSON.stringify(sounds.rows.map((r) => r.name))}`);
+      if (sounds.rows.some((r) => m.rows.some((v) => v.name === r.name))) throw new Error("a quality is in both tabs");
+      const pictures = await tab("video");
+      // 720p from the Video tab.
+      const row = pictures.rows.find((r) => /\b720p\b/.test(r.name));
+      if (!row) throw new Error(`no 720p in the Video tab: ${JSON.stringify(pictures.rows.map((r) => r.name))}`);
+      const picked = Date.now();
       await t.session.mouse(row.x, row.y, "click");
       // MDM downloads the stream's manifest, with only the download's progress window.
       const item = await until("the quality picked, in MDM's list", 15000, async () => (await mdmList()).find((d) => !before.has(d.id)));
       if (item.url !== `${LAB}/hls/master.m3u8`) throw new Error(`MDM downloads ${item.url}, not the stream's manifest`);
       const opened = await until("the download's progress window", 15000, () => progress(appWindows(pid)));
+      const startMs = Date.now() - picked;
       if (await t.session.picks()) throw new Error("the menu stayed open after the pick");
       // A moment more: nothing else comes up after it.
       await sleep(1500);
       const after = appWindows(pid);
       if (main(after).length) throw new Error(`the main window showed (${after.join(", ")})`);
       if (after.includes(VIDEO_WINDOW)) throw new Error("the Download video window opened too");
-      const rows = m.rows.map((r) => `${r.name}${r.size ? ` ${r.size}` : ""}`).join(", ");
-      return `${looked ? "looking, then " : ""}${m.rows.length} qualities (${rows}); "${row.name}" picked: ${item.file} (${item.status}) with its progress window "${opened}" only, the main window hidden`;
+      const list = (rs) => rs.map((r) => `${r.name}${r.size ? ` ${r.size}` : ""}`).join(", ");
+      return `${looked ? "looking, then " : ""}Video tab ${pictures.rows.length} (${list(pictures.rows)}), Audio tab ${sounds.rows.length} (${list(sounds.rows)}); "${row.name}" picked: ${item.file} (${item.status}) with its progress window "${opened}" only, the main window hidden; click to rows ${rowsMs} ms, pick to first progress ${startMs} ms`;
     } finally {
       // The next case starts MDM as usual.
       await stopApp();

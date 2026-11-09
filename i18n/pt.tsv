@@ -5569,6 +5569,10 @@ extension	Added to the queue	Adicionado à fila
 #, machine
 extension	Another Mister Download Manager (a server)	Outro Mister Download Manager (um servidor)
 #. text in the browser extension
+#. tab above the list of qualities in the menu under the download button over a video: the choices that are sound only (MP3, Opus and the like); short, one word
+#, machine
+extension	Audio	Áudio
+#. text in the browser extension
 #. the name this browser gets in the other MDM's list of paired devices
 #, machine
 extension	Browser extension	Extensão do navegador
@@ -5867,6 +5871,10 @@ extension	Update Mister Download Manager to use everything this extension offers
 #. why a download stayed with the browser: the app's setting 'Use advanced browser integration' is off; keep the setting's name as the app shows it
 #, machine
 extension	Use advanced browser integration is off in Options → General.	A opção "Utilizar integração avançada do navegador" está desativada em Opções → Geral.
+#. text in the browser extension
+#. tab above the list of qualities in the menu under the download button over a video: the choices that include picture (video with sound); short, one word
+#, machine
+extension	Video	Vídeo
 #. text in the browser extension
 #. pairing failed: codes tried too fast
 #, machine

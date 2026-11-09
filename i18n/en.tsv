@@ -133,6 +133,8 @@
 #. window title in extracting archives (a download's log, the Archive password window)
 #. window title: 7-Zip (a program's name) must be installed
 	7-Zip needed	7-Zip needed
+#. tab in the main window
+	720p	720p
 #. text in the Options window
 #. Options → Archives: {path} is where 7-Zip's program is
 	7z and RAR archives are extracted by 7-Zip ({path}).	7z and RAR archives are extracted by 7-Zip ({path}).
@@ -4124,6 +4126,9 @@ extension	Added to the queue	Added to the queue
 #. choice under Send downloads to: an MDM running on another computer of the network, such as a home server; keep the name Mister Download Manager as it is
 extension	Another Mister Download Manager (a server)	Another Mister Download Manager (a server)
 #. text in the browser extension
+#. tab above the list of qualities in the menu under the download button over a video: the choices that are sound only (MP3, Opus and the like); short, one word
+extension	Audio	Audio
+#. text in the browser extension
 #. the name this browser gets in the other MDM's list of paired devices
 extension	Browser extension	Browser extension
 #. text in the browser extension
@@ -4349,6 +4354,9 @@ extension	Update Mister Download Manager to use everything this extension offers
 #. text in the browser extension
 #. why a download stayed with the browser: the app's setting 'Use advanced browser integration' is off; keep the setting's name as the app shows it
 extension	Use advanced browser integration is off in Options → General.	Use advanced browser integration is off in Options → General.
+#. text in the browser extension
+#. tab above the list of qualities in the menu under the download button over a video: the choices that include picture (video with sound); short, one word
+extension	Video	Video
 #. text in the browser extension
 #. pairing failed: codes tried too fast
 extension	Wait a moment, then try again.	Wait a moment, then try again.

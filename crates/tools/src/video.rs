@@ -1,12 +1,15 @@
 //! A video download run by yt-dlp under supervision: our file name, progress read from a fixed
 //! `--progress-template`, the final path from `--print after_move`. Stopping kills it; starting
-//! again continues (`--continue`). Each start looks the page up afresh (`-J`), points links at
+//! again continues (`--continue`). Each run takes the page as looked up (`-J`), points links at
 //! servers that answer ([`crate::servers`]) and downloads from that list (`--load-info-json`),
-//! so the page is read once.
+//! so a run reads the page once. A run looks the page up afresh, except the first run of a
+//! download chosen in the browser's quality menu, which takes the look-up the menu was made from
+//! ([`Preloaded`]): the page is then read once for the menu and the download together.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::proc::{self, ProcError};
 use crate::servers;
@@ -216,6 +219,308 @@ fn side_files(video: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// How long the browser's quality menu's look-up may take: a stream's playlists
+/// (`crate::manifest`, 5 s), yt-dlp's look-up and its second one without the cookies
+/// (`proc::look_up`, 90 s each), and a little more. The download chosen there waits for it that
+/// long at most, and a second click shares a look-up still running that long (the app's
+/// videolookup.rs).
+pub const LOOKUP_WAIT: Duration = Duration::from_secs(
+    crate::manifest::BUDGET.as_secs() + 2 * crate::resolve::LOOK_UP_TIMEOUT.as_secs() + 5,
+);
+
+/// The largest look-up kept for the download (a page's is a few hundred KB, YouTube's a few MB):
+/// a bigger one isn't kept, and the download looks the page up itself.
+pub const INFO_MAX: usize = 8 * 1024 * 1024;
+
+/// All the look-ups kept at once, together: past it, the oldest are let go (their downloads look
+/// the page up themselves). Twenty look-ups are kept for ten minutes (videolookup.rs), and
+/// [`INFO_MAX`] each would be 160 MB.
+pub const INFO_TOTAL: usize = 32 * 1024 * 1024;
+
+/// The look-ups' answers kept, oldest first, with their sizes: what [`INFO_TOTAL`] counts. A
+/// look-up no longer kept anywhere (its slot dropped) counts no more.
+struct Kept {
+    limit: usize,
+    answers: Mutex<std::collections::VecDeque<(std::sync::Weak<SlotInner>, usize)>>,
+}
+
+impl Kept {
+    fn new(limit: usize) -> Arc<Kept> {
+        Arc::new(Kept {
+            limit,
+            answers: Mutex::default(),
+        })
+    }
+
+    /// Every look-up's: the process's own pool.
+    fn shared() -> Arc<Kept> {
+        static POOL: std::sync::LazyLock<Arc<Kept>> =
+            std::sync::LazyLock::new(|| Kept::new(INFO_TOTAL));
+        POOL.clone()
+    }
+
+    /// `slot` keeps an answer of `len` bytes now: the oldest others are let go while all of
+    /// them together are more than the limit.
+    fn add(&self, slot: &Arc<SlotInner>, len: usize) {
+        let mut answers = self.answers.lock().unwrap_or_else(|e| e.into_inner());
+        answers.retain(|(s, _)| s.strong_count() > 0);
+        answers.push_back((Arc::downgrade(slot), len));
+        let mut total: usize = answers.iter().map(|(_, n)| n).sum();
+        while total > self.limit && answers.len() > 1 {
+            let Some((oldest, n)) = answers.pop_front() else {
+                break;
+            };
+            total -= n;
+            if let Some(s) = oldest.upgrade() {
+                s.let_go();
+            }
+        }
+    }
+}
+
+/// yt-dlp's look-up (`-J`) of a page for the browser's quality menu, kept for the download
+/// chosen from it: being looked up, done (the answer as yt-dlp gave it, and whether it took
+/// looking the page up without cookies), or failed. In memory only, never written or logged
+/// (its links are signed): its `Debug` shows nothing of it.
+#[derive(Clone)]
+pub struct InfoSlot(Arc<SlotInner>);
+
+struct SlotInner {
+    info: Mutex<Info>,
+    changed: Condvar,
+    born: Instant,
+    /// Where its answer counts ([`INFO_TOTAL`]).
+    pool: Arc<Kept>,
+}
+
+impl SlotInner {
+    /// Its answer dropped to make room: as if the look-up had failed.
+    fn let_go(&self) {
+        let mut info = self.info.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*info, Info::Ready(..)) {
+            *info = Info::Failed;
+            self.changed.notify_all();
+        }
+    }
+}
+
+enum Info {
+    Pending,
+    Ready(Arc<Vec<u8>>, bool),
+    Failed,
+}
+
+impl std::fmt::Debug for InfoSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InfoSlot")
+    }
+}
+
+impl InfoSlot {
+    /// A look-up begun at `born`.
+    pub fn new(born: Instant) -> Self {
+        Self::counted_in(born, Kept::shared())
+    }
+
+    fn counted_in(born: Instant, pool: Arc<Kept>) -> Self {
+        InfoSlot(Arc::new(SlotInner {
+            info: Mutex::new(Info::Pending),
+            changed: Condvar::new(),
+            born,
+            pool,
+        }))
+    }
+
+    pub fn born(&self) -> Instant {
+        self.0.born
+    }
+
+    fn info(&self) -> std::sync::MutexGuard<'_, Info> {
+        self.0.info.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// yt-dlp answered with `json` (`without_cookies`: as `proc::LookedUp` says). Bigger than
+    /// [`INFO_MAX`]: as if it had failed; the oldest others are let go past [`INFO_TOTAL`]. Only
+    /// a look-up still pending takes it.
+    pub fn fill(&self, json: Vec<u8>, without_cookies: bool) {
+        let len = json.len();
+        {
+            let mut info = self.info();
+            if !matches!(*info, Info::Pending) {
+                return;
+            }
+            *info = if len > INFO_MAX {
+                Info::Failed
+            } else {
+                Info::Ready(Arc::new(json), without_cookies)
+            };
+            self.0.changed.notify_all();
+        }
+        // Not under its own lock: letting another go locks that one.
+        if len <= INFO_MAX {
+            self.0.pool.add(&self.0, len);
+        }
+    }
+
+    /// The look-up failed (or ended without an answer): the download looks the page up itself.
+    pub fn fail(&self) {
+        let mut info = self.info();
+        if matches!(*info, Info::Pending) {
+            *info = Info::Failed;
+            self.0.changed.notify_all();
+        }
+    }
+
+    pub fn pending(&self) -> bool {
+        matches!(*self.info(), Info::Pending)
+    }
+
+    /// How many hold this look-up (the menu's, the download chosen from it): a check that a
+    /// choice let go of it.
+    pub fn holders(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+
+    /// The answer once there, waiting until `until` at most, or until `stopped` says so.
+    fn wait(&self, until: Instant, stopped: impl Fn() -> bool) -> Option<(Arc<Vec<u8>>, bool)> {
+        let mut info = self.info();
+        loop {
+            match &*info {
+                Info::Ready(json, without) => return Some((json.clone(), *without)),
+                Info::Failed => return None,
+                Info::Pending => {}
+            }
+            let now = Instant::now();
+            if now >= until || stopped() {
+                return None;
+            }
+            // A tenth of a second at a time: a Stop meanwhile is seen at once.
+            let step = (until - now).min(Duration::from_millis(100));
+            info = self
+                .0
+                .changed
+                .wait_timeout(info, step)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+}
+
+/// The browser's quality menu's look-up for the download chosen there (its first run only):
+/// the look-up, and the choice as the menu offered it (MDM's selector, its label, untranslated,
+/// and whether the menu's list had merged qualities). The page yt-dlp read must offer that very
+/// choice, or the run looks the page up itself.
+pub struct Preloaded {
+    pub slot: InfoSlot,
+    pub selector: String,
+    pub label: String,
+    pub merge: bool,
+}
+
+/// How a run tells whether a media server can be reached and serves a stream, in place of
+/// `servers::reachable` and `servers::Prober` (which ask the servers): set by tests only
+/// (tests/fake_ytdlp.rs), whose servers must never be asked.
+type ServerChecks = (fn(&str) -> bool, fn(&str) -> bool);
+
+static SERVER_CHECKS: std::sync::RwLock<Option<ServerChecks>> = std::sync::RwLock::new(None);
+
+/// Tests only: media servers `alive` says are reachable, serving every stream `serves` says.
+#[doc(hidden)]
+pub fn check_servers_with(alive: fn(&str) -> bool, serves: fn(&str) -> bool) {
+    *SERVER_CHECKS.write().unwrap_or_else(|e| e.into_inner()) = Some((alive, serves));
+}
+
+/// yt-dlp's look-up `json` as a run's page, when it offers `selector` under `label` among its
+/// choices (`resolve::choices` with `merge`): the menu offered that very choice from it.
+fn offered(json: &[u8], selector: &str, label: &str, merge: bool) -> Option<serde_json::Value> {
+    let video = crate::resolve::parse(json)?;
+    crate::resolve::choices(&video, merge)
+        .iter()
+        .any(|c| c.selector == selector && c.label == label)
+        .then(|| serde_json::from_slice(json).ok())
+        .flatten()
+}
+
+/// The containers and sounds yt-dlp saves (`%(ext)s`), merged, converted or as the site has them.
+const MEDIA: [&str; 19] = [
+    "mp4", "m4a", "m4v", "webm", "weba", "mkv", "mka", "mov", "flv", "3gp", "ts", "mp3", "opus",
+    "ogg", "oga", "flac", "wav", "aac", "avi",
+];
+/// The subtitle files yt-dlp saves beside a video (#68).
+const SUBTITLES: [&str; 10] = [
+    "srt", "vtt", "ass", "ssa", "ttml", "srv1", "srv2", "srv3", "json3", "lrc",
+];
+
+/// Whether `rest`, a file name after `<stem>.` (lower case), is one yt-dlp writes for a download
+/// saved as `<stem>.%(ext)s`: an unfinished run's (`<ext>.part`, `<ext>.ytdl`,
+/// `<ext>.part-Frag<N>[.part]`, each also for one stream of a merged choice as `f<id>.<ext>…`,
+/// that stream once whole, `f<id>.<ext>`, and a merge's `temp.<ext>`); with `outputs`, also the
+/// finished file (`<ext>`) and its subtitles (`<language>.<srt|vtt…>`). Nothing else: another
+/// download's files (MDM's own `.mdm.part`), a file merely named alike.
+fn yt_dlp_leftover(rest: &str, outputs: bool) -> bool {
+    let media = |s: &str| MEDIA.contains(&s);
+    let word = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    // A format id as yt-dlp names a stream: `137`, `hls-720p`, `dash-1`, `http-480`.
+    let format = |s: &str| {
+        s.strip_prefix('f').is_some_and(|id| {
+            word(id)
+                && (id.starts_with(|c: char| c.is_ascii_digit())
+                    || ["hls-", "dash-", "http-"].iter().any(|p| {
+                        id.strip_prefix(p)
+                            .is_some_and(|r| r.chars().any(|c| c.is_ascii_digit()))
+                    }))
+        })
+    };
+    let fragment = |s: &str| {
+        s.strip_prefix("part-frag")
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    };
+    let parts: Vec<&str> = rest.split('.').collect();
+    // An unfinished file: `<ext>` then `part`, `ytdl`, `part-frag<N>` or `part-frag<N>.part`.
+    let unfinished = |p: &[&str]| match p {
+        [ext, "part" | "ytdl"] => media(ext),
+        [ext, frag] => media(ext) && fragment(frag),
+        [ext, frag, "part"] => media(ext) && fragment(frag),
+        _ => false,
+    };
+    let working = match parts.as_slice() {
+        ["temp", ext] => media(ext),
+        [f, ext] if format(f) => media(ext),
+        [f, tail @ ..] if format(f) => unfinished(tail),
+        p => unfinished(p),
+    };
+    let finished = outputs
+        && match parts.as_slice() {
+            [ext] => media(ext),
+            [language, sub] => word(language) && SUBTITLES.contains(sub),
+            _ => false,
+        };
+    working || finished
+}
+
+/// What yt-dlp left in `dir` for a download saved as `<stem>.%(ext)s` (our template), as
+/// [`yt_dlp_leftover`] tells them, letter case aside: what an unfinished run left, and with
+/// `outputs` the finished file and its subtitles. A file not of that shape is left alone.
+pub fn own_files(dir: &Path, stem: &str, outputs: bool) -> Vec<PathBuf> {
+    let prefix = format!("{}.", stem.to_lowercase());
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    rd.filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            name.strip_prefix(&prefix)
+                .is_some_and(|rest| yt_dlp_leftover(rest, outputs))
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
 pub struct VideoJob {
     /// yt-dlp once the page is looked up (`None` before).
     child: Arc<Mutex<Option<proc::Spawned>>>,
@@ -323,7 +628,10 @@ fn supervise(
     child: &Child,
     expected: Option<u64>,
     retry: Option<&SubsRetry>,
+    preloaded: Option<Preloaded>,
 ) {
+    // The first run only: a run after it looks the page up afresh (links expire).
+    let mut preloaded = preloaded;
     let mut ours = ours.to_vec();
     let mut dead: std::collections::BTreeSet<String> = Default::default();
     let mut looked_again = false;
@@ -331,8 +639,19 @@ fn supervise(
     let mut reroute = true;
     let mut last = String::from("yt-dlp stopped");
     for _ in 0..5 {
+        let page = preloaded.take();
         match attempt(
-            exe, url, &ours, browser, progress, child, expected, retry, &dead, reroute,
+            exe,
+            url,
+            &ours,
+            browser,
+            progress,
+            child,
+            expected,
+            retry,
+            &dead,
+            reroute,
+            page.as_ref(),
         ) {
             Attempt::Stopped => return,
             Attempt::Done(f, problems, quality) => {
@@ -632,10 +951,29 @@ fn pause(d: std::time::Duration, progress: &Mutex<Progress>) -> bool {
     progress.lock().unwrap().state != State::Stopped
 }
 
-/// One run: look the page up, move links off unreachable servers (and off `dead`, the ones an
-/// earlier run couldn't reach), download from that list. Subtitles the site refused are asked
-/// for once more after a pause (`retry`), beside the video; the ones still refused are reported
-/// with it, never failing it.
+/// The page as the quality menu's look-up read it (`preloaded`), once yt-dlp has answered there
+/// (waiting for it as long as that look-up may take, [`LOOKUP_WAIT`]) and if it offers the choice
+/// the menu showed; else none, and the run looks the page up itself.
+fn preloaded_page(
+    preloaded: &Preloaded,
+    progress: &Mutex<Progress>,
+) -> Option<(serde_json::Value, bool)> {
+    let until = preloaded.slot.born() + LOOKUP_WAIT;
+    let stopped = || progress.lock().unwrap().state == State::Stopped;
+    let (json, without_cookies) = preloaded.slot.wait(until, stopped)?;
+    let info = offered(
+        &json,
+        &preloaded.selector,
+        &preloaded.label,
+        preloaded.merge,
+    )?;
+    Some((info, without_cookies))
+}
+
+/// One run: look the page up (or take the quality menu's look-up, `preloaded`), move links off
+/// unreachable servers (and off `dead`, the ones an earlier run couldn't reach), download from
+/// that list. Subtitles the site refused are asked for once more after a pause (`retry`), beside
+/// the video; the ones still refused are reported with it, never failing it.
 #[allow(clippy::too_many_arguments)]
 fn attempt(
     exe: &Path,
@@ -648,9 +986,16 @@ fn attempt(
     retry: Option<&SubsRetry>,
     dead: &std::collections::BTreeSet<String>,
     reroute: bool,
+    preloaded: Option<&Preloaded>,
 ) -> Attempt {
     let failed = |error: String, rerouted: bool| Attempt::Failed { error, rerouted };
-    let mut info = match look_up(exe, url, browser) {
+    let page = match preloaded.and_then(|p| preloaded_page(p, progress)) {
+        Some(page) => Ok(page),
+        // Stopped while waiting for it: nothing more to do.
+        None if progress.lock().unwrap().state == State::Stopped => return Attempt::Stopped,
+        None => look_up(exe, url, browser),
+    };
+    let mut info = match page {
         Ok((v, without_cookies)) => {
             if without_cookies {
                 note(
@@ -662,7 +1007,14 @@ fn attempt(
         }
         Err(e) => return failed(e, false),
     };
-    let changed = if reroute {
+    let checks = *SERVER_CHECKS.read().unwrap_or_else(|e| e.into_inner());
+    let changed = if let (true, Some((alive, serves))) = (reroute, checks) {
+        servers::reroute(
+            &mut info,
+            |h| !dead.contains(h) && alive(h),
+            |l, _| serves(l),
+        )
+    } else if reroute {
         let prober = servers::Prober::new();
         servers::reroute(
             &mut info,
@@ -842,7 +1194,29 @@ impl VideoJob {
         browser: &proc::FromBrowser,
         subs: &Subs,
     ) -> Result<VideoJob, ProcError> {
+        Self::start_with(
+            exe, url, selector, dir, stem, rate, ffmpeg, expected, browser, subs, None,
+        )
+    }
+
+    /// [`VideoJob::start`], the first run taking the quality menu's look-up (`preloaded`) when
+    /// it is for this very choice.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with(
+        exe: &Path,
+        url: &str,
+        selector: &str,
+        dir: &Path,
+        stem: &str,
+        rate: Option<u64>,
+        ffmpeg: Option<&Path>,
+        expected: Option<u64>,
+        browser: &proc::FromBrowser,
+        subs: &Subs,
+        preloaded: Option<Preloaded>,
+    ) -> Result<VideoJob, ProcError> {
         proc::safe(url)?;
+        let preloaded = preloaded.filter(|p| p.selector == selector);
         let output = dir.join(format!("{}.%(ext)s", template_text(stem)));
         // An MP3, Opus or FLAC choice (#32, #70): the best sound, converted by ffmpeg.
         let convert = crate::resolve::audio_conversion(selector);
@@ -954,6 +1328,7 @@ impl VideoJob {
                         &child,
                         expected,
                         retry.as_ref(),
+                        preloaded,
                     )
                 });
                 if std::panic::catch_unwind(run).is_err() {
@@ -988,6 +1363,78 @@ impl VideoJob {
 mod tests {
     use super::*;
 
+    /// A video download's files that "overwrite" (a duplicate added again) removes: exactly what
+    /// yt-dlp leaves for its stem, the finished file and subtitles only with `outputs`; never a
+    /// file merely named alike, another stem's, or MDM's own part files.
+    #[test]
+    fn a_videos_own_files_are_exactly_yt_dlps() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let working = [
+            "Clip.mp4.part",
+            "Clip.mp4.ytdl",
+            "Clip.mp4.part-Frag4",
+            "Clip.mp4.part-Frag4.part",
+            "Clip.f137.mp4",
+            "Clip.f137.mp4.part",
+            "Clip.f137.mp4.ytdl",
+            "Clip.f137.mp4.part-Frag12",
+            "Clip.f137.mp4.part-Frag12.part",
+            "Clip.f251.webm.part",
+            "Clip.fhls-720p.mp4",
+            "Clip.fdash-1.m4a.part",
+            "Clip.fhttp-480p.mp4",
+            "clip.temp.mp4",
+        ];
+        let finished = [
+            "Clip.mp4",
+            "Clip.en.srt",
+            "Clip.pt-BR.vtt",
+            "Clip.fr.srt",
+            "Clip.fi.vtt",
+        ];
+        let others = [
+            "Clip.final.mp4",
+            "Clip.full.mkv",
+            "Clip.f1.jpg",
+            "Clip.fhls-video.mp4",
+            "Clip.v2.mp4.part",
+            "Clip.pdf.mdm.part",
+            "Clip.v2.zip.mdm.part",
+            "Clip.mp4.mdm.part",
+            "Clip.zip",
+            "Clip.notes.txt",
+            "Clip.final cut.mp4",
+            "Clip.mp4.part-Fragment",
+            "Clip (1).f137.mp4",
+            "Clip (1).f137.mp4.part",
+            "Clip (1).en.srt",
+            "Clipper.mp4.part",
+            "Other.en.srt",
+        ];
+        for f in working.iter().chain(&finished).chain(&others) {
+            std::fs::write(d.join(f), b"x").unwrap();
+        }
+        let names = |outputs| {
+            let mut n: Vec<String> = own_files(d, "Clip", outputs)
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            n.sort();
+            n
+        };
+        let mut want: Vec<String> = working.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(
+            names(false),
+            want,
+            "subtitles (fr.srt, fi.vtt) are never working files"
+        );
+        want.extend(finished.iter().map(|s| s.to_string()));
+        want.sort();
+        assert_eq!(names(true), want);
+        assert!(own_files(&d.join("missing"), "Clip", true).is_empty());
+    }
     /// Live (network, yt-dlp): `MDM_LIVE_YTDLP=<yt-dlp.exe> MDM_LIVE_PAGE=<video page>
     /// cargo test -p mdm-tools live_download -- --ignored --nocapture`. Downloads the smallest
     /// audio and prints the log (a swapped server shows there).
@@ -1328,6 +1775,91 @@ mod tests {
                 .into_owned(),
         ];
         assert_eq!(saved_by_name(&none), None);
+    }
+
+    /// A2: the quality menu's look-up is taken for the very choice it offered only (its selector
+    /// under the same label, merged or not as the menu had it), and waited for while it's being
+    /// made, never past its time or a Stop. Too big to keep: none. Nothing of it in `Debug`.
+    #[test]
+    fn the_menus_look_up_serves_its_own_choice_only() {
+        const PAGE: &str = r#"{"title": "T", "duration": 10, "formats": [
+            {"format_id": "18", "ext": "mp4", "height": 360, "vcodec": "avc1", "acodec": "mp4a", "tbr": 500}]}"#;
+        let page = PAGE.as_bytes();
+        assert!(offered(page, "b[height=360]", "360p MP4", false).is_some());
+        assert!(offered(page, "b[height=720]", "720p MP4", false).is_none());
+        assert!(offered(page, "b[height=360]", "360p WEBM", false).is_none());
+        assert!(offered(page, "b[height=360]", "360p MP4", true).is_none());
+        assert!(offered(page, "bv*[height=360]+ba/b[height=360]", "360p MP4", true).is_some());
+        assert!(offered(b"not json", "b", "b", false).is_none());
+
+        let slot = InfoSlot::new(Instant::now());
+        let filler = slot.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            filler.fill(page.to_vec(), true);
+        });
+        let (json, without) = slot
+            .wait(Instant::now() + Duration::from_secs(10), || false)
+            .unwrap();
+        assert_eq!((json.as_slice(), without), (page, true));
+        slot.fail();
+        assert!(slot.wait(Instant::now(), || false).is_some(), "kept");
+        assert_eq!(format!("{slot:?}"), "InfoSlot");
+
+        let pending = InfoSlot::new(Instant::now());
+        let at = Instant::now();
+        assert!(
+            pending
+                .wait(at + Duration::from_millis(200), || false)
+                .is_none()
+        );
+        assert!(at.elapsed() >= Duration::from_millis(200));
+        assert!(
+            pending
+                .wait(at + Duration::from_secs(60), || true)
+                .is_none(),
+            "stopped"
+        );
+        assert!(pending.pending());
+        pending.fail();
+        assert!(!pending.pending());
+
+        let big = InfoSlot::new(Instant::now());
+        big.fill(vec![b' '; INFO_MAX + 1], false);
+        assert!(!big.pending());
+        assert!(
+            big.wait(Instant::now() + Duration::from_secs(1), || false)
+                .is_none()
+        );
+    }
+
+    /// All the look-ups kept together stay within their budget: the oldest answers are let go
+    /// (their downloads look the page up afresh); one no longer kept anywhere counts no more.
+    #[test]
+    fn look_ups_kept_have_a_budget_together() {
+        let pool = Kept::new(100);
+        let now = Instant::now();
+        let kept = |n: usize| {
+            let slot = InfoSlot::counted_in(now, pool.clone());
+            slot.fill(vec![b' '; n], false);
+            slot
+        };
+        let has = |s: &InfoSlot| s.wait(Instant::now(), || false).is_some();
+        let (a, b) = (kept(40), kept(40));
+        assert!(has(&a) && has(&b));
+        let c = kept(40);
+        assert!(!has(&a), "the oldest let go");
+        assert!(has(&b) && has(&c));
+        assert!(!a.pending(), "not waited for either");
+        // Dropped: its 40 bytes are free.
+        drop(b);
+        let d = kept(40);
+        assert!(has(&c) && has(&d));
+        // One bigger than the rest together: the others go, it stays.
+        let e = kept(90);
+        assert!(!has(&c) && !has(&d) && has(&e));
+        // The process's own pool: INFO_TOTAL.
+        assert_eq!(Kept::shared().limit, INFO_TOTAL);
     }
 
     #[test]

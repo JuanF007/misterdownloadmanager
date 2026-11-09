@@ -1,0 +1,27 @@
+{
+ "title": "nocodecs",
+ "duration": 115,
+ "subtitles": {},
+ "formats": [
+  {
+   "format_id": "aud-English",
+   "ext": "mp4",
+   "vcodec": "none",
+   "tbr": null
+  },
+  {
+   "format_id": "900",
+   "ext": "mp4",
+   "height": 360,
+   "fps": null,
+   "tbr": 900.0
+  },
+  {
+   "format_id": "2500",
+   "ext": "mp4",
+   "height": 720,
+   "fps": null,
+   "tbr": 2500.0
+  }
+ ]
+}

@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "ค้นหาไม่สำเร็จ"
   },
+  "video_tab_video": {
+    "message": "วิดีโอ"
+  },
+  "video_tab_audio": {
+    "message": "เสียง"
+  },
   "popup_send_to": {
     "message": "ส่งการดาวน์โหลดไปยัง"
   },

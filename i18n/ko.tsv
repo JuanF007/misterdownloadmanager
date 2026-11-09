@@ -5569,6 +5569,10 @@ extension	Added to the queue	대기열에 추가되었습니다
 #, machine
 extension	Another Mister Download Manager (a server)	다른 Mister Download Manager (서버)
 #. text in the browser extension
+#. tab above the list of qualities in the menu under the download button over a video: the choices that are sound only (MP3, Opus and the like); short, one word
+#, machine
+extension	Audio	오디오
+#. text in the browser extension
 #. the name this browser gets in the other MDM's list of paired devices
 #, machine
 extension	Browser extension	브라우저 확장
@@ -5867,6 +5871,10 @@ extension	Update Mister Download Manager to use everything this extension offers
 #. why a download stayed with the browser: the app's setting 'Use advanced browser integration' is off; keep the setting's name as the app shows it
 #, machine
 extension	Use advanced browser integration is off in Options → General.	옵션 → 일반에서 고급 브라우저 통합 사용이 꺼져 있습니다.
+#. text in the browser extension
+#. tab above the list of qualities in the menu under the download button over a video: the choices that include picture (video with sound); short, one word
+#, machine
+extension	Video	비디오
 #. text in the browser extension
 #. pairing failed: codes tried too fast
 #, machine

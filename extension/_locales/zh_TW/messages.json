@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "無法尋找"
   },
+  "video_tab_video": {
+    "message": "影片"
+  },
+  "video_tab_audio": {
+    "message": "音訊"
+  },
   "popup_send_to": {
     "message": "傳送下載項目至"
   },

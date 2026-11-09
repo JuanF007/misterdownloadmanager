@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "തിരയാൻ കഴിഞ്ഞില്ല"
   },
+  "video_tab_video": {
+    "message": "വീഡിയോ"
+  },
+  "video_tab_audio": {
+    "message": "ഓഡിയോ"
+  },
   "popup_send_to": {
     "message": "ഡൗൺലോഡുകൾ ഇതിലേക്ക് അയയ്ക്കുക"
   },

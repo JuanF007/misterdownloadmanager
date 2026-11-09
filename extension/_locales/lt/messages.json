@@ -215,6 +215,12 @@
   "video_failed_lookup": {
     "message": "Nepavyko surasti"
   },
+  "video_tab_video": {
+    "message": "Vaizdas"
+  },
+  "video_tab_audio": {
+    "message": "Garsas"
+  },
   "popup_send_to": {
     "message": "Siųsti atsisiuntimus į"
   },

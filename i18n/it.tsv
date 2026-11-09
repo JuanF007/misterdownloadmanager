@@ -4130,6 +4130,10 @@ extension	Added to the queue	Aggiunto alla coda
 #. choice under Send downloads to: an MDM running on another computer of the network, such as a home server; keep the name Mister Download Manager as it is
 extension	Another Mister Download Manager (a server)	Un altro Mister Download Manager (un server)
 #. text in the browser extension
+#. tab above the list of qualities in the menu under the download button over a video: the choices that are sound only (MP3, Opus and the like); short, one word
+#, machine
+extension	Audio	Audio
+#. text in the browser extension
 #. the name this browser gets in the other MDM's list of paired devices
 extension	Browser extension	Estensione del browser
 #. text in the browser extension
@@ -4363,6 +4367,10 @@ extension	Update Mister Download Manager to use everything this extension offers
 #. text in the browser extension
 #. why a download stayed with the browser: the app's setting 'Use advanced browser integration' is off; keep the setting's name as the app shows it
 extension	Use advanced browser integration is off in Options → General.	L'opzione "Usa l'integrazione avanzata con i browser" è disattivata in Opzioni → Generale.
+#. text in the browser extension
+#. tab above the list of qualities in the menu under the download button over a video: the choices that include picture (video with sound); short, one word
+#, machine
+extension	Video	Video
 #. text in the browser extension
 #. pairing failed: codes tried too fast
 extension	Wait a moment, then try again.	Attendi un momento, poi riprova.
