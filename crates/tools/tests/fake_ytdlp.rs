@@ -151,7 +151,7 @@ fn fake_ytdlp() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    println!("MDMP 1024 4096 NA 1000");
+    println!("MDMP 1024 4096 NA 1000 18");
     println!("MDMQ 18 640x360");
     // #79: it falls over mid-way, leaving a helper running (Windows: the launcher's child).
     if mode == "crash" {

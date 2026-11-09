@@ -737,14 +737,34 @@ fn supervise(
 /// The most the bar shows while yt-dlp still works.
 const MAX_WHILE_RUNNING: f64 = 0.999;
 
-/// yt-dlp's progress lines (`MDMP <downloaded> <total> <estimate> <speed>`) made into one
-/// steady figure. Each stream of a merged download (video, then audio) reports from 0 with its
-/// own total, and a fragmented stream's total (HLS, DASH) is an estimate that moves with every
-/// fragment: the streams are added up, the total never falls below the size the video window
-/// showed (`expected`, every stream), and the fraction done goes back only when a stream's end
-/// had looked like the whole (no `expected`, the next stream starts).
+/// yt-dlp's progress lines (`MDMP <downloaded> <total> <estimate> <speed> <format id>`) made
+/// into one steady figure. Each stream of a merged download (video, then audio) reports from 0
+/// with its own total, and a fragmented stream's total (HLS, DASH) is an estimate that moves with
+/// every fragment: the streams are added up, and the fraction done goes back only when a stream's
+/// end had looked like the whole (no `expected`, the next stream starts).
+///
+/// The size the video window showed (`expected`, every stream) holds the total up until the last
+/// stream: a stream's end before it never looks like the whole download (#344). That size is
+/// often an estimate (an HLS stream's bitrate, a peak, times its length) well above what comes:
+/// in the last stream, once yt-dlp knows that stream's own total, the total is what came before
+/// and that stream's, so the bar reaches the end. Which streams there are, yt-dlp says before it
+/// downloads ([`Meter::quality`]), and each line names the one it is for ([`Meter::named`]).
+///
+/// A line named otherwise (no `MDMQ`, an id it didn't name, `NA`) is read as before: back near 0
+/// is the next stream, never counted as one of `MDMQ`'s, and the window's size holds the total.
+/// Subtitle files come before the video with lines of their own, `NA` (#68): what they brought
+/// leaves the bar when the first stream's line comes.
 struct Meter {
     expected: Option<u64>,
+    /// `MDMQ`'s format id and resolution (`137+140 1920x1080`), once yt-dlp has said.
+    quality: Option<String>,
+    /// The stream the lines are for now (its format id), how many of `MDMQ`'s streams have
+    /// started, and whether a line was for all of them at once (`137+140`).
+    current: Option<String>,
+    started: usize,
+    all_at_once: bool,
+    /// Every line so far said `NA` for its format id (subtitle files).
+    only_na: bool,
     /// The streams already finished, and the current one's last total and bytes.
     finished: u64,
     last_total: u64,
@@ -757,6 +777,11 @@ impl Meter {
     fn new(expected: Option<u64>) -> Self {
         Meter {
             expected: expected.filter(|e| *e > 0),
+            quality: None,
+            current: None,
+            started: 0,
+            all_at_once: false,
+            only_na: true,
             finished: 0,
             last_total: 0,
             last_got: 0,
@@ -764,23 +789,94 @@ impl Meter {
         }
     }
 
+    /// yt-dlp's `MDMQ <format id> <resolution>` ([`QUALITY`]): a merged choice's id names each
+    /// stream (`137+140`).
+    fn quality(&mut self, rest: &str) {
+        let rest = rest.trim();
+        self.quality = (!rest.is_empty()).then(|| rest.to_owned());
+    }
+
+    /// How many streams `MDMQ` named.
+    fn streams(&self) -> Option<usize> {
+        self.quality.as_ref().map(|q| q.split('+').count())
+    }
+
+    /// Whether a line's format `id` is one of the streams `MDMQ` named (`137` of `137+140`;
+    /// false), or all of them at once (`137+140`, as ffmpeg downloads and merges them; true).
+    /// None for any other: none named, `NA`, an id `MDMQ` didn't name, no `MDMQ`.
+    fn named<'a>(&self, id: Option<&'a str>) -> Option<(&'a str, bool)> {
+        let (q, id) = (self.quality.as_deref()?, id.filter(|id| *id != "NA")?);
+        // The id, then the resolution after the last one (one word, or two: `audio only`).
+        let is = |s: &str| {
+            s.strip_prefix(id)
+                .is_some_and(|r| r.is_empty() || r.starts_with(' '))
+        };
+        if q.split('+').any(is) {
+            Some((id, false))
+        } else {
+            is(q).then_some((id, true))
+        }
+    }
+
+    /// The next stream started: the one before counts in full.
+    fn next_stream(&mut self) {
+        self.finished += self.last_total.max(self.last_got);
+        self.last_total = 0;
+        self.last_got = 0;
+        // Without the whole size from the start, the first stream's end looked like the
+        // whole download: the next stream's total pulls the bar back (#344).
+        if self.expected.is_none() {
+            self.frac = 0.0;
+        }
+    }
+
     fn line(&mut self, rest: &str, p: &mut Progress) {
-        let f: Vec<Option<f64>> = rest.split_whitespace().map(|v| v.parse().ok()).collect();
-        let got = f.first().copied().flatten().unwrap_or(0.0).max(0.0) as u64;
+        let fields: Vec<&str> = rest.trim().splitn(5, ' ').collect();
+        let f: Vec<Option<f64>> = fields.iter().take(4).map(|v| v.parse().ok()).collect();
+        let mut got = f.first().copied().flatten().unwrap_or(0.0).max(0.0) as u64;
         let total = f
             .get(1)
             .copied()
             .flatten()
             .or(f.get(2).copied().flatten())
             .map(|t| t.max(0.0) as u64);
-        // Back near 0: the next stream started; the one before counts in full.
-        if got < self.last_got && self.last_got > 0 {
-            self.finished += self.last_total.max(self.last_got);
-            self.last_total = 0;
-            // Without the whole size from the start, the first stream's end looked like the
-            // whole download: the next stream's total pulls the bar back (#344).
-            if self.expected.is_none() {
-                self.frac = 0.0;
+        let id = fields
+            .get(4)
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty());
+        let named = self.named(id);
+        match named {
+            // Each stream by its own id: a count from 0 again within one (a retry from the
+            // start) is not the next stream, and the bar waits there until it is back where it
+            // was.
+            Some((id, _)) if self.current.as_deref() == Some(id) => {
+                got = got.max(self.last_got);
+            }
+            Some((id, all)) => {
+                if self.only_na {
+                    // Subtitle files came first (#68): theirs are not the video's bytes (the bar
+                    // gives back their share of the whole, a sliver beside a video's).
+                    self.finished = 0;
+                    self.last_total = 0;
+                    self.last_got = 0;
+                    self.frac = 0.0;
+                } else if self.current.is_some() || self.last_got > 0 {
+                    self.next_stream();
+                }
+                if all {
+                    self.all_at_once = true;
+                } else {
+                    self.started += 1;
+                }
+                self.current = Some(id.to_owned());
+                self.only_na = false;
+            }
+            // As before: back near 0 is the next stream.
+            None => {
+                if got < self.last_got && self.last_got > 0 {
+                    self.next_stream();
+                }
+                self.only_na &= id == Some("NA");
             }
         }
         self.last_got = got;
@@ -797,7 +893,16 @@ impl Meter {
             return;
         }
         let mut whole = self.finished + self.last_total.max(got);
-        if let Some(e) = self.expected {
+        // The window's size stands for the streams still to come (less what is known so far);
+        // in the last stream, once its own total is known, nothing is left to come. When that
+        // size was an estimate above what came, the bar lurches forward there (a merged
+        // download's audio, after its video: from about the video's share of the estimate to
+        // its share of what came); never back, and it glides there in the progress window.
+        let last = named.is_some()
+            && (self.all_at_once || self.streams().is_some_and(|n| self.started >= n));
+        if let Some(e) = self.expected
+            && !(last && self.last_total > 0)
+        {
             whole = whole.max(e);
         }
         if whole == 0 {
@@ -874,6 +979,9 @@ fn run(
         if let Some(rest) = line.strip_prefix("MDMF ") {
             saved = Some(PathBuf::from(rest.trim()));
         } else if let Some(rest) = line.strip_prefix("MDMQ ") {
+            if let Some(m) = meter.as_deref_mut() {
+                m.quality(rest);
+            }
             quality = Some(rest.trim().to_owned());
         } else if let Some(rest) = line.strip_prefix("MDMP ")
             && let Some(m) = meter.as_deref_mut()
@@ -1166,8 +1274,9 @@ fn template_text(s: &str) -> String {
     s.replace('%', "%%")
 }
 
-/// Our progress line: `MDMP <downloaded> <total> <estimate> <speed>` (`NA` when unknown).
-const PROGRESS: &str = "download:MDMP %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s %(progress.speed)s";
+/// Our progress line: `MDMP <downloaded> <total> <estimate> <speed> <format id>` (`NA` when
+/// unknown; the format id is the stream's, `NA` for a subtitle file).
+const PROGRESS: &str = "download:MDMP %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s %(progress.speed)s %(info.format_id)s";
 /// The final file: `MDMF <path>`.
 const FINAL: &str = "after_move:MDMF %(filepath)s";
 /// The quality yt-dlp chose, before it downloads: `MDMQ <format id> <resolution>` (the log names
@@ -1554,11 +1663,18 @@ mod tests {
             side_files: Vec::new(),
             sub_problems: Vec::new(),
         };
+        // `MDMQ …` as yt-dlp prints it before it downloads; every other line is an `MDMP` one's.
         lines
             .iter()
-            .map(|l| {
-                m.line(l, &mut p);
-                (p.downloaded, p.total)
+            .filter_map(|l| match l.strip_prefix("MDMQ ") {
+                Some(q) => {
+                    m.quality(q);
+                    None
+                }
+                None => {
+                    m.line(l, &mut p);
+                    Some((p.downloaded, p.total))
+                }
             })
             .collect()
     }
@@ -1617,13 +1733,278 @@ mod tests {
     }
 
     /// The size the window showed counts both streams from the start: the first stream alone
-    /// never looks like the whole download.
+    /// never looks like the whole download, whether or not yt-dlp has named the streams.
     #[test]
     fn expected_size_holds_the_bar_back() {
         let v = run(Some(1000), &["400 400 NA 0"]);
         assert_eq!(v[0], (400, Some(1000)));
+        let v = run(Some(1000), &["MDMQ 137+140 1920x1080", "400 400 NA 0 137"]);
+        assert_eq!(v[0], (400, Some(1000)));
+    }
+
+    /// A line with no figure at all: no percentage.
+    #[test]
+    fn a_line_of_nothing_is_no_percentage() {
         let v = run(None, &["NA NA NA NA"]);
         assert_eq!(v[0], (0, None));
+    }
+
+    /// Never back, but for the total's rounding to a whole byte (these sizes are tiny).
+    fn assert_forward(f: &[f64]) {
+        for w in f.windows(2) {
+            assert!(w[1] >= w[0] - 1e-3, "went back: {f:?}");
+        }
+    }
+
+    fn assert_ends(f: &[f64]) {
+        assert!(f[f.len() - 1] >= MAX_WHILE_RUNNING - 1e-9, "{f:?}");
+        assert!(f.iter().all(|x| *x < 1.0), "100 % before the end: {f:?}");
+    }
+
+    /// An HLS stream's lines, as yt-dlp prints them for format `id` (none: lines without one,
+    /// as before it was asked for): from nothing, then its estimate after each of `frags`
+    /// fragments of `frag` bytes, then its own total at its end.
+    fn hls_stream(id: &str, frags: u64, frag: u64) -> Vec<String> {
+        let whole = frags * frag;
+        let mut out = vec!["0 NA NA 0".to_owned()];
+        out.extend((1..frags).map(|k| format!("{} NA {whole} 5", k * frag)));
+        out.push(format!("{whole} {whole} NA 5"));
+        out.into_iter()
+            .map(|l| format!("{l} {id}").trim_end().to_owned())
+            .collect()
+    }
+
+    fn lines<'a>(quality: Option<&'a str>, streams: &'a [Vec<String>]) -> Vec<&'a str> {
+        quality
+            .into_iter()
+            .chain(streams.iter().flatten().map(String::as_str))
+            .collect()
+    }
+
+    /// The figures as before yt-dlp named its streams: the same lines without `MDMQ` and without
+    /// their format ids.
+    fn as_before(expected: Option<u64>, streams: &[Vec<String>]) -> Vec<(u64, Option<u64>)> {
+        let bare: Vec<Vec<String>> = streams
+            .iter()
+            .map(|s| {
+                s.iter()
+                    .map(|l| l.splitn(5, ' ').take(4).collect::<Vec<_>>().join(" "))
+                    .collect()
+            })
+            .collect();
+        run(expected, &lines(None, &bare))
+    }
+
+    /// The video window's size an estimate twice what comes (an HLS stream's BANDWIDTH is its
+    /// peak): with yt-dlp's word that the choice is one stream, the bar ends at the end, not
+    /// halfway; never back. Without that word, as before: the window's size holds it.
+    #[test]
+    fn an_estimate_above_the_size_still_ends_at_the_end() {
+        let stream = [hls_stream("hls-6400", 10, 100)];
+        let f = fractions(&run(
+            Some(2000),
+            &lines(Some("MDMQ hls-6400 1280x720"), &stream),
+        ));
+        assert_forward(&f);
+        assert_ends(&f);
+        let f = fractions(&as_before(Some(2000), &stream));
+        assert!((f[f.len() - 1] - 0.5).abs() < 1e-9, "{f:?}");
+    }
+
+    /// The same for a merged choice (video, then audio): the bar ends at the end, and the
+    /// video's end is still not the whole download, nor does the bar go back (#344).
+    #[test]
+    fn a_merged_estimate_above_the_size_still_ends_at_the_end() {
+        let streams = [
+            hls_stream("hls-7040", 16, 100),
+            hls_stream("hls-aud-English", 4, 100),
+        ];
+        let v = run(
+            Some(4000),
+            &lines(Some("MDMQ hls-7040+hls-aud-English 1280x720"), &streams),
+        );
+        let f = fractions(&v);
+        assert_forward(&f);
+        let video_end = streams[0].len() - 1;
+        assert!(f[video_end] < 0.75, "the video's end looked whole: {f:?}");
+        assert_ends(&f);
+        assert_eq!(v[v.len() - 1].0, 2000);
+    }
+
+    /// One line for all the streams at once (`137+140`: yt-dlp's ffmpeg downloader fetches and
+    /// merges them together, and says so once, at the end): that is the whole download, and its
+    /// own total its end.
+    #[test]
+    fn a_line_for_every_stream_at_once_is_the_whole_download() {
+        let q = "MDMQ 7040+aud-English 1280x720";
+        let all = [hls_stream("7040+aud-English", 20, 100)];
+        let f = fractions(&run(Some(4000), &lines(Some(q), &all)));
+        assert_forward(&f);
+        assert_ends(&f);
+        let v = run(Some(4000), &[q, "2000 2000 NA 2129866.9 7040+aud-English"]);
+        assert_ends(&fractions(&v));
+    }
+
+    /// Lines whose format id `MDMQ` didn't name, or `NA` on every line (a yt-dlp that names no
+    /// stream): read exactly as before, never left out (the bar never stands still at 0).
+    #[test]
+    fn lines_not_named_by_mdmq_are_read_as_before() {
+        for (expected, ids) in [
+            (Some(4000), ["999", "998"]),
+            (Some(4000), ["NA", "NA"]),
+            (Some(2000), ["NA", "NA"]),
+            (None, ["NA", "NA"]),
+            (None, ["999", "998"]),
+        ] {
+            let streams = [hls_stream(ids[0], 16, 100), hls_stream(ids[1], 4, 100)];
+            let v = run(expected, &lines(Some("MDMQ 137+140 1920x1080"), &streams));
+            assert_eq!(v, as_before(expected, &streams), "{expected:?} {ids:?}");
+            assert_eq!(v[v.len() - 1].0, 2000);
+            if expected != Some(4000) {
+                assert_ends(&fractions(&v[v.len() - 1..]));
+            }
+        }
+    }
+
+    /// Subtitles asked for (#68): yt-dlp downloads their file first, with lines of its own that
+    /// name no format, `NA` (as yt-dlp 2026.10.26 prints them for an HLS subtitle rendition), each
+    /// file counting from 0 again. They are no stream: the video is not taken for the last one,
+    /// its end is still not the whole download (#344), and their bytes leave the bar when the
+    /// video's first line comes.
+    #[test]
+    fn subtitles_before_the_video_are_no_stream() {
+        let streams = [
+            hls_stream("NA", 3, 10),
+            hls_stream("NA", 3, 10),
+            hls_stream("137", 16, 100),
+            hls_stream("140", 4, 100),
+        ];
+        let v = run(Some(4000), &lines(Some("MDMQ 137+140 1920x1080"), &streams));
+        let subs = streams[0].len() + streams[1].len();
+        assert!(fractions(&v[..subs]).iter().all(|x| *x < 0.02), "{v:?}");
+        assert_eq!(v[subs - 1].0, 60);
+        assert_eq!(v[subs].0, 0);
+        let f = fractions(&v[subs..]);
+        assert_forward(&f);
+        let video_end = streams[2].len() - 1;
+        assert!(f[video_end] < 0.75, "the video's end looked whole: {f:?}");
+        assert_ends(&f);
+        assert_eq!(v[v.len() - 1].0, 2000);
+    }
+
+    /// A stream's count from 0 again (a retry from the start) is the same stream, not the next
+    /// one: the video is not taken for the last stream, its bytes count once, and the bar waits
+    /// where it was until the retry is back there.
+    #[test]
+    fn a_retry_from_the_start_is_not_the_next_stream() {
+        let mut video = hls_stream("137", 16, 100);
+        video.splice(
+            9..9,
+            ["300 NA 1600 5 137".to_owned(), "0 NA NA 0 137".to_owned()],
+        );
+        let streams = [video, hls_stream("140", 4, 100)];
+        let v = run(Some(4000), &lines(Some("MDMQ 137+140 1920x1080"), &streams));
+        assert_eq!([v[8].0, v[9].0, v[10].0, v[11].0], [800, 800, 800, 900]);
+        let f = fractions(&v);
+        assert_forward(&f);
+        let video_end = streams[0].len() - 1;
+        assert!(f[video_end] < 0.75, "the video's end looked whole: {f:?}");
+        assert_ends(&f);
+        assert_eq!(v[video_end].0, 1600);
+        assert_eq!(v[v.len() - 1].0, 2000);
+    }
+
+    /// A variable bitrate's estimates: low at first, then up and down around the size as the
+    /// fragments come. The bar never goes back and ends at the end.
+    #[test]
+    fn noisy_estimates_never_pull_the_bar_back() {
+        let mut l = vec![
+            "MDMQ hls-1 1280x720".to_owned(),
+            "0 NA NA 0 hls-1".to_owned(),
+        ];
+        for (got, estimate) in [
+            (100, 400),
+            (200, 900),
+            (300, 1300),
+            (400, 1100),
+            (500, 1000),
+            (600, 1200),
+            (700, 1000),
+            (800, 1050),
+            (900, 1000),
+        ] {
+            l.push(format!("{got} NA {estimate} 5 hls-1"));
+        }
+        l.push("1000 1000 NA 5 hls-1".to_owned());
+        let l: Vec<&str> = l.iter().map(String::as_str).collect();
+        let f = fractions(&run(Some(2000), &l));
+        assert_forward(&f);
+        assert_ends(&f);
+    }
+
+    /// The video window's size below what comes: the same figures as before yt-dlp named its
+    /// streams (a stream's end never pulls the bar back).
+    #[test]
+    fn an_estimate_below_the_size_is_as_before() {
+        for (expected, streams, quality) in [
+            (1000, vec![hls_stream("22", 15, 100)], "MDMQ 22 1280x720"),
+            (
+                1200,
+                vec![hls_stream("137", 16, 100), hls_stream("140", 4, 100)],
+                "MDMQ 137+140 1920x1080",
+            ),
+            (
+                1800,
+                vec![hls_stream("137", 16, 100), hls_stream("140", 4, 100)],
+                "MDMQ 137+140 1920x1080",
+            ),
+        ] {
+            let with = run(Some(expected), &lines(Some(quality), &streams));
+            assert_eq!(with, as_before(Some(expected), &streams));
+            assert_forward(&fractions(&with));
+        }
+    }
+
+    /// The streams `MDMQ` names, and which format ids are theirs: the resolution after the last
+    /// one (two words for a sound) is not part of its id; the merged id is all of them at once;
+    /// nothing is named before yt-dlp has said, nor `NA`.
+    #[test]
+    fn the_streams_are_named_by_their_format_ids() {
+        let mut m = Meter::new(None);
+        assert_eq!(m.named(Some("137")), None);
+        let cases: [(&str, &[&str], &[&str]); 4] = [
+            (
+                "137+140 1920x1080",
+                &["137", "140"],
+                &["13", "14", "251", "NA"],
+            ),
+            ("18 640x360", &["18"], &["1", "640x360"]),
+            (
+                "hls-720p+hls-audio-English 1280x720",
+                &["hls-720p", "hls-audio-English"],
+                &["hls-audio", "hls-720p+hls-audio"],
+            ),
+            (
+                "aud-English (US) audio only",
+                &["aud-English (US)"],
+                &["aud"],
+            ),
+        ];
+        for (q, ids, others) in cases {
+            m.quality(q);
+            assert_eq!(m.streams(), Some(ids.len()), "{q}");
+            for id in ids {
+                assert_eq!(m.named(Some(*id)), Some((*id, false)), "{q}");
+            }
+            for id in others {
+                assert_eq!(m.named(Some(*id)), None, "{q}: {id}");
+            }
+        }
+        m.quality("137+140 1920x1080");
+        assert_eq!(m.named(Some("137+140")), Some(("137+140", true)));
+        assert_eq!(m.named(None), None);
+        m.quality("");
+        assert_eq!(m.streams(), None);
     }
 
     /// The subtitle arguments (#68): none asked, none passed; beside the video as SRT with

@@ -144,6 +144,10 @@ const GLIDE_MAX: f64 = 0.5;
 /// Figures that moved this recently (seconds) keep the frames coming, so the next one is drawn
 /// as it comes, not at the app's next quarter second.
 const GLIDE_HOLD: f64 = 1.0;
+/// How long a finished download's window shows it whole before it gives way to Download
+/// complete (app.rs): its bar, a glide behind the figures, would otherwise close short of the
+/// end.
+pub const SHOWN_WHOLE: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// The bar's fill and the segment map between the download's figures, which come about four
 /// times a second: each part moves from where it was drawn to its new figure over about the
@@ -200,12 +204,14 @@ impl Glide {
     }
 
     /// The figures read at `now` (`done` bytes; the segments' starts and bytes done): what to
-    /// draw.
-    fn step(&mut self, now: f64, done: u64, segments: &[(u64, u64)]) -> Drawn {
-        if !self.seen {
+    /// draw. `finished`: the download is done, its figures drawn as they are at once (the
+    /// window shows it whole before it gives way to Download complete, not a glide behind).
+    fn step(&mut self, now: f64, done: u64, segments: &[(u64, u64)], finished: bool) -> Drawn {
+        if !self.seen || finished {
             self.seen = true;
             self.at = now;
             self.span = 0.0;
+            self.rate = 0.0;
             self.from_done = done as f64;
             self.from_segments = segments.iter().map(|&(_, d)| d as f64).collect();
             self.done = done;
@@ -377,9 +383,12 @@ impl Progress {
                 .collect(),
             _ => vec![(0, item.downloaded)],
         };
-        let drawn = self
-            .glide
-            .step(ctx.input(|i| i.time), item.downloaded, &segments);
+        let drawn = self.glide.step(
+            ctx.input(|i| i.time),
+            item.downloaded,
+            &segments,
+            item.status == Status::Complete,
+        );
         let bar = item
             .size
             .filter(|t| *t > 0)
@@ -2052,7 +2061,7 @@ mod glide_tests {
             .map(|k| {
                 let now = k as f64 * 0.04;
                 let real = (now / 0.25).floor() as u64 * delta;
-                (now, real, g.step(now, real, &[(0, real)]).done)
+                (now, real, g.step(now, real, &[(0, real)], false).done)
             })
             .collect()
     }
@@ -2061,7 +2070,7 @@ mod glide_tests {
     #[test]
     fn the_first_figures_are_drawn_as_they_are() {
         let mut g = Glide::default();
-        let d = g.step(3.0, 700, &[(0, 300), (1000, 400)]);
+        let d = g.step(3.0, 700, &[(0, 300), (1000, 400)], false);
         assert_eq!(d.done, 700.0);
         assert_eq!(d.segments, [(0, 300.0), (1000, 400.0)]);
     }
@@ -2087,13 +2096,30 @@ mod glide_tests {
     #[test]
     fn a_figure_that_goes_back_is_drawn_at_once() {
         let mut g = Glide::default();
-        g.step(0.0, 0, &[(0, 0)]);
-        g.step(0.25, 1000, &[(0, 1000)]);
-        let d = g.step(0.40, 1000, &[(0, 1000)]);
+        g.step(0.0, 0, &[(0, 0)], false);
+        g.step(0.25, 1000, &[(0, 1000)], false);
+        let d = g.step(0.40, 1000, &[(0, 1000)], false);
         assert!(d.done > 0.0 && d.done < 1000.0);
-        let d = g.step(0.41, 10, &[(0, 10)]);
+        let d = g.step(0.41, 10, &[(0, 10)], false);
         assert_eq!(d.done, 10.0);
         assert_eq!(d.segments, [(0, 10.0)]);
+    }
+
+    /// A finished download is drawn whole at once, not a glide behind its last figures: its
+    /// window shows it whole before it gives way to Download complete; no frames of its own.
+    #[test]
+    fn a_finished_download_is_drawn_whole_at_once() {
+        let mut g = Glide::default();
+        g.step(0.0, 0, &[(0, 0)], false);
+        g.step(0.25, 999, &[(0, 999)], false);
+        let d = g.step(0.30, 999, &[(0, 999)], false);
+        assert!(d.done < 999.0, "{}", d.done);
+        let d = g.step(0.31, 1000, &[(0, 1000)], true);
+        assert_eq!(d.done, 1000.0);
+        assert_eq!(d.segments, [(0, 1000.0)]);
+        assert_eq!(d.rate, 0.0);
+        let d = g.step(0.35, 1000, &[(0, 1000)], true);
+        assert_eq!(d.done, 1000.0);
     }
 
     /// A file's bar counts what has come before it is written (the engine's map moves later):
@@ -2101,10 +2127,10 @@ mod glide_tests {
     #[test]
     fn the_bar_glides_on_its_own_figure() {
         let mut g = Glide::default();
-        g.step(0.0, 0, &[(0, 0)]);
-        let d = g.step(0.25, 1000, &[(0, 0)]);
+        g.step(0.0, 0, &[(0, 0)], false);
+        let d = g.step(0.25, 1000, &[(0, 0)], false);
         assert!(d.rate > 0.0);
-        let d = g.step(0.40, 1000, &[(0, 0)]);
+        let d = g.step(0.40, 1000, &[(0, 0)], false);
         assert!(d.done > 0.0 && d.done < 1000.0, "{}", d.done);
         assert_eq!(d.segments, [(0, 0.0)]);
     }
@@ -2125,7 +2151,7 @@ mod glide_tests {
                 }
             }
             let done: u64 = segs.iter().map(|s| s.1).sum();
-            let d = g.step(now, done, &segs);
+            let d = g.step(now, done, &segs, false);
             let sum: f64 = d.segments.iter().map(|s| s.1).sum();
             assert!(
                 (sum - d.done).abs() < 1e-6,
@@ -2143,13 +2169,13 @@ mod glide_tests {
     #[test]
     fn frames_are_asked_for_only_while_the_figures_move() {
         let mut g = Glide::default();
-        assert_eq!(g.step(0.0, 0, &[(0, 0)]).rate, 0.0);
-        let d = g.step(0.25, 100, &[(0, 100)]);
+        assert_eq!(g.step(0.0, 0, &[(0, 0)], false).rate, 0.0);
+        let d = g.step(0.25, 100, &[(0, 100)], false);
         assert!((d.rate - 100.0 / (0.25 * 1.25)).abs() < 1e-9, "{}", d.rate);
-        let d = g.step(0.25 + GLIDE_MAX, 100, &[(0, 100)]);
+        let d = g.step(0.25 + GLIDE_MAX, 100, &[(0, 100)], false);
         assert_eq!(d.done, 100.0);
         assert!(d.rate > 0.0, "moved lately");
-        let d = g.step(0.25 + GLIDE_HOLD + 0.01, 100, &[(0, 100)]);
+        let d = g.step(0.25 + GLIDE_HOLD + 0.01, 100, &[(0, 100)], false);
         assert_eq!(d.done, 100.0);
         assert_eq!(d.rate, 0.0, "still: the app's own pace");
     }
