@@ -1,8 +1,11 @@
 // Mister Download Manager's download button over videos (a content script, in every page and
 // frame). Our own design: a small pill at the video's edge that appears while the pointer is
 // over the video (or it has the keyboard's focus) and fades when the pointer rests or leaves.
-// Clicking it opens the app's Download video window for this page (an embedded player's own
-// address, which yt-dlp understands), with the video's own address when it has a plain one. It can be dragged along the video's edge, and stays where
+// Clicking it has the app look the video up (an embedded player's own address, which yt-dlp
+// understands, with the video's own address when it has a plain one) and lists its qualities in a
+// menu over the page; the one picked downloads without the app's window. An app that can't look
+// up (an older one, another MDM chosen) opens its Download video window for this page instead,
+// as does the menu's last command. It can be dragged along the video's edge, and stays where
 // it was put on that site. Its menu hides it on this video, keeps it off the site (the app's
 // Options → General → Download panels lists those sites), or opens those settings. The app
 // decides where it may show at all (the native host: integration on, this browser captured,
@@ -40,7 +43,18 @@
     video_drm: "Protected video: it can't be saved",
     video_unnamed: "Can't tell which video this is: open its own page and try there",
     video_drag: "Drag to move it along the video's edge",
+    video_looking: "Looking up the qualities…",
+    video_open_mdm: "Open in Mister Download Manager…",
+    video_no_choices: "No video to download here",
+    video_playlist: "A list of videos: choose them in Mister Download Manager",
+    video_no_ytdlp: "Mister Download Manager needs yt-dlp for this video",
+    video_too_long: "Looking up took too long",
+    video_busy: "Mister Download Manager is busy with other videos",
+    video_queued: "Added to the queue",
+    video_failed_lookup: "Could not look it up",
   };
+  // Sizes as the browser's language writes them.
+  const lang = ext.i18n.getUILanguage?.() || undefined;
   // To the background. After the extension was updated or removed, this page's copy of the script
   // is cut off from it (calls throw at once): then it takes itself away.
   const send = (m) => {
@@ -120,6 +134,122 @@
     return location.href;
   }
 
+  // ---- the qualities: the app looks the video up (yt-dlp), the user picks one here ------------
+  // How long a lookup is followed, from the click.
+  const LOOKUP_MS = 60000;
+
+  // The wait before asking again how a lookup is going: 1 s, a little longer each time, 2 s at
+  // most.
+  function pollDelay(n) {
+    return Math.min(2000, Math.round(1000 * 1.25 ** Math.max(0, n)));
+  }
+
+  // A size as the browser's language writes it ("178.8 MB"); "" when unknown.
+  function sizeText(bytes, lang) {
+    const n = Number(bytes);
+    if (!Number.isFinite(n) || n <= 0) return "";
+    const units = [["gigabyte", 2 ** 30], ["megabyte", 2 ** 20], ["kilobyte", 2 ** 10]];
+    const [unit, per] = units.find(([, u]) => n >= u) || ["byte", 1];
+    try {
+      return new Intl.NumberFormat(lang, { style: "unit", unit, unitDisplay: "short", maximumFractionDigits: 1 }).format(n / per);
+    } catch {
+      return `${(n / per).toFixed(1)} ${unit}`;
+    }
+  }
+
+  // What a quality's row says: the app's name for it (in the app's language) and its size. Only
+  // ever set as text, never as markup.
+  function rowText(choice, lang) {
+    const c = choice && typeof choice === "object" ? choice : {};
+    return { name: String(c.label ?? "").slice(0, 200), size: sizeText(c.size, lang) };
+  }
+
+  // Follows a lookup the app is running, from its first answer: asks again only once the last
+  // question was answered (never on a timer of its own), pollDelay apart, until it is no longer
+  // pending (that answer, with its token), the minute is up ({state: "late"}) or it is no longer
+  // wanted (null: the menu closed, the video or the page changed). `ask(token, ms)`: the
+  // background's answer, or {late: true} after `ms`; `sleep(ms)` may end early when dropped.
+  async function followLookup(first, { ask, alive, sleep, now, end }) {
+    let s = first;
+    let token = "";
+    for (let n = 0; ; n += 1) {
+      if (!alive()) return null;
+      if (!s || typeof s !== "object") return { state: "gone" };
+      if (typeof s.token === "string" && s.token) token = s.token;
+      if (s.state !== "pending") return { ...s, token };
+      if (!token) return { state: "gone" };
+      const left = end - now();
+      if (left <= 0) return { state: "late" };
+      await sleep(Math.min(pollDelay(n), left));
+      if (!alive()) return null;
+      if (end - now() <= 0) return { state: "late" };
+      const r = await ask(token, end - now());
+      if (!alive() || !r || r.gone) return null;
+      if (r.late) return { state: "late" };
+      // Another MDM chosen meanwhile: the window, as for a click.
+      s = r.fallback ? { state: "use-window" } : r.lookup;
+    }
+  }
+
+  // The background's answer to a lookup or to a choice, as a lookup's state: null when there is
+  // nothing to show (the extension gone); "late" past the minute, "unnamed" for a video it can't
+  // tell, and "use-window" for no lookups here (another MDM, an older one) or an answer that
+  // isn't one.
+  function replyState(r) {
+    if (r && r.gone) return null;
+    if (r && r.late) return { state: "late" };
+    if (r && r.why === "unnamed") return { state: "unnamed" };
+    if (!r || r.fallback || !r.lookup || typeof r.lookup !== "object") return { state: "use-window" };
+    return r.lookup;
+  }
+
+  // What a lookup's state (or replyState's) comes to, as the menu does it: "follow" it while the
+  // app looks, "offer" its qualities, "say" a message in the menu (with the app's own words under
+  // it), "flash" a word on the button (the menu closed), or "window": the click as it always was,
+  // the app's Download video window. `t`: the texts. `picked`: the answer to a choice, which only
+  // a download confirms; anything else there is the window's.
+  function lookupAction(s, t, picked) {
+    const state = s && typeof s === "object" && typeof s.state === "string" ? s.state : "";
+    // A choice taken: downloading, in the queue, or handed to the app, which didn't say in time
+    // what became of it ("sent": it will download it; the window would download it again).
+    if (state === "started" || state === "sent") return { act: "flash", kind: "ok", text: t("video_sent") };
+    if (state === "queued") return { act: "flash", kind: "ok", text: t("video_queued") };
+    if (!picked) {
+      if (state === "pending") return { act: "follow" };
+      if (state === "ready" && Array.isArray(s.choices) && s.choices.length) return { act: "offer" };
+      if (state === "ready" || (state === "failed" && s.reason === "no-choices")) return { act: "say", text: t("video_no_choices") };
+      if (state === "failed" && s.reason === "no-ytdlp") return { act: "say", text: t("video_no_ytdlp") };
+      if (state === "failed") return { act: "say", text: t("video_failed_lookup"), detail: typeof s.message === "string" ? s.message : "" };
+      if (state === "late") return { act: "say", text: t("video_too_long") };
+      if (state === "list") return { act: "say", text: t("video_playlist") };
+      if (state === "busy") return { act: "say", text: t("video_busy") };
+      if (state === "off") return { act: "flash", kind: "err", text: t("video_off") };
+      if (state === "unnamed") return { act: "flash", kind: "err", text: t("video_unnamed") };
+    }
+    // "use-window", "gone" (the app forgot it: restarted), a choice the app didn't take, and
+    // anything newer: the window.
+    return { act: "window" };
+  }
+
+  // The click's window at most once, whichever way the click comes to it (an answer that isn't a
+  // lookup, the lookup's end, a choice the app didn't take, "Open in…"): true the first time for
+  // `j`, the click's lookup.
+  function firstWindow(j) {
+    if (!j || j.windowed) return false;
+    j.windowed = true;
+    return true;
+  }
+
+  // The video the pointer takes the button to: the one under it (`found`), but not another than
+  // its own (`shown`) while the qualities' menu is open (`picking`): the menu reaches over the
+  // videos around its own (a feed's), and the pointer crosses them on its way to a row. The menu
+  // still closes when its video plays something else or the page changes (tick), or on a click
+  // elsewhere.
+  function pointerTarget(found, shown, picking) {
+    if (!found || (picking && found !== shown)) return null;
+    return found;
+  }
+
   // The address this page first loaded at (`download`: a page that moves in place keeps its first
   // page's og:title).
   const landedAt = location.href;
@@ -138,6 +268,8 @@
   let menuOpen = false;
   let dragging = null;
   let busy = false;
+  // The lookup the qualities menu is for (one at a time), until the menu closes.
+  let job = null;
   let flashing = false;
   let raf = 0;
   let scan = 0;
@@ -203,6 +335,15 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
 .menu button { display: block; width: 100%; padding: 8px 12px; border-radius: 6px; cursor: default; }
 .menu button:hover, .menu button:focus-visible { background: #dceafb; outline: none; }
 .menu hr { border: 0; border-top: 1px solid rgba(23, 50, 77, .12); margin: 4px 2px; }
+/* The qualities: a row each (the app's name for it, its size at the end), a message while it
+   looks or when it found none, "Open in…" last. Scrolls when there are many. */
+.picks { min-width: 240px; max-width: 360px; max-height: min(300px, 45vh); overflow: auto; overscroll-behavior: contain; }
+.picks:focus { outline: none; }
+.menu .pick { display: flex; align-items: baseline; gap: 16px; }
+.pick .name { overflow-wrap: anywhere; }
+.pick .size { margin-inline-start: auto; color: #4a6681; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.note { padding: 8px 12px; color: #3b5876; overflow-wrap: anywhere; }
+.note .why { display: block; margin-top: 4px; font-size: 12px; color: #5a7086; }
 @media (prefers-reduced-motion: reduce) { .pill { transition: none; transform: none; } }
 `;
   // A constructed sheet: a page whose Content-Security-Policy refuses inline styles can't strip
@@ -234,6 +375,12 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
   <button role="menuitem" data-act="never"></button>
   <hr>
   <button role="menuitem" data-act="settings"></button>
+</div>
+<div class="menu picks" role="menu" tabindex="-1" aria-describedby="said">
+  <div class="note" id="said" role="status"></div>
+  <div class="rows" role="none"></div>
+  <hr>
+  <button role="menuitem" data-act="window"></button>
 </div>`;
   shadow.querySelector(".go img").src = LOGO;
   const pill = shadow.querySelector(".pill");
@@ -242,8 +389,16 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
   const more = shadow.querySelector(".more");
   const menu = shadow.querySelector(".menu");
   const item = (act) => menu.querySelector(`[data-act="${act}"]`);
+  // The qualities' menu: its message, its rows, "Open in…".
+  const picks = shadow.querySelector(".picks");
+  const note = picks.querySelector(".note");
+  const rows = picks.querySelector(".rows");
+  const openRow = picks.querySelector('[data-act="window"]');
+  // Which of the two menus is open (`menuOpen`).
+  let panel = menu;
   pill.dir = ext.i18n.getMessage("@@bidi_dir") || "ltr";
   menu.dir = pill.dir;
+  picks.dir = pill.dir;
   const idleLabel = t("video_download");
   label.textContent = idleLabel;
   go.title = `${idleLabel} — ${t("video_drag")}`;
@@ -254,6 +409,8 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
   item("hide").textContent = t("video_hide_here");
   item("never").textContent = ext.i18n.getMessage("video_never_site", [host]) || `Never on ${host}`;
   item("settings").textContent = t("video_settings");
+  picks.setAttribute("aria-label", idleLabel);
+  openRow.textContent = t("video_open_mdm");
 
   // ---- which video ----------------------------------------------------------------------------
   const videos = document.getElementsByTagName("video");
@@ -333,16 +490,16 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
     if (menuOpen) placeMenu(top, left, w);
   }
 
-  // The menu opens below the button, or above it near the bottom of the window; aligned with
-  // whichever of its sides is nearer the video's middle.
+  // The open menu opens below the button, or above it near the bottom of the window; aligned
+  // with whichever of its sides is nearer the video's middle.
   function placeMenu(top, left, w) {
-    const h = menu.offsetHeight;
+    const h = panel.offsetHeight;
     const below = top + 36 + h < innerHeight;
-    menu.style.top = below ? "36px" : `${-h - 4}px`;
+    panel.style.top = below ? "36px" : `${-h - 4}px`;
     const { r } = rects();
     const rightHalf = left + w / 2 > r.left + r.width / 2;
-    menu.style.left = rightHalf ? "" : "0";
-    menu.style.right = rightHalf ? "0" : "";
+    panel.style.left = rightHalf ? "" : "0";
+    panel.style.right = rightHalf ? "0" : "";
   }
 
   // Snap a free spot (fractions, after a drag) to the nearest edge.
@@ -405,6 +562,8 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
     const r = video.getBoundingClientRect();
     const over =
       pointer.x >= r.left && pointer.x <= r.right && pointer.y >= r.top && pointer.y <= r.bottom;
+    // The qualities' menu for a video this element no longer plays, or a page left: it goes.
+    if (menuOpen && panel === picks && !(job && current(job))) closeMenu();
     const onButton = root.matches(":hover");
     if (!onButton && !menuOpen && !dragging && !keyboardOn() && (!over || Date.now() - lastMove > IDLE_MS)) {
       return hide();
@@ -423,7 +582,8 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
   function look() {
     scan = 0;
     if (dragging || allowed === false) return;
-    const v = videoAt(pointer.x, pointer.y);
+    // Kept on its video while the qualities' menu is open (pointerTarget).
+    const v = pointerTarget(videoAt(pointer.x, pointer.y), video, menuOpen && panel === picks);
     if (!v) return;
     if (allowed === null) return void ask().then(() => allowed && look());
     show(v);
@@ -445,27 +605,228 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
   }
 
   // ---- acting ---------------------------------------------------------------------------------
+  // The middle of the video: where the background asks the page's own player what it plays.
+  function middle(v) {
+    const box = v.getBoundingClientRect();
+    return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+  }
+
+  // What a click is about: the video's own file (a plain address), the page's title, the video's
+  // page and its middle.
+  function describe(v) {
+    const src = /^https?:/i.test(v.currentSrc || "") ? v.currentSrc : "";
+    // A page that moved in place keeps its first page's og:title; its document title follows.
+    const og = location.href === landedAt ? document.querySelector('meta[property="og:title"]')?.content : "";
+    const title = (og || document.title || "").trim();
+    // Asked now, not kept: one <video> plays many videos at the same address (a feed's previews).
+    return { src, title, url: videoPage(v), at: middle(v) };
+  }
+
+  // A promise's answer, or {late: true} once `ms` is up.
+  const within = (promise, ms) => {
+    let timer = 0;
+    const late = new Promise((done) => (timer = setTimeout(() => done({ late: true }), Math.max(0, ms))));
+    return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+  };
+
+  // The click: the app looks the video up and its qualities open in a menu here. An app that can't
+  // (an older one, another MDM chosen) gets the click as it always was: its Download video window.
   async function download() {
+    // The button again while its qualities are open: they close.
+    if (menuOpen && panel === picks) return closeMenu();
     if (busy || !video) return;
     busy = true;
     try {
       closeMenu();
       // Encrypted (DRM): no tool can save it; say so rather than send it.
       if (video.mediaKeys) return flash("err", t("video_drm"));
-      const src = /^https?:/i.test(video.currentSrc || "") ? video.currentSrc : "";
-      // A page that moved in place keeps its first page's og:title; its document title follows.
-      const og = location.href === landedAt ? document.querySelector('meta[property="og:title"]')?.content : "";
-      const title = (og || document.title || "").trim();
-      // The middle of the video: where the background asks the page's own player what it plays.
-      const box = video.getBoundingClientRect();
-      const at = { x: box.left + box.width / 2, y: box.top + box.height / 2 };
-      // Asked now, not kept: one <video> plays many videos at the same address (a feed's previews).
-      const r = await send({ type: "video", src, title, url: videoPage(video), at });
-      if (r.gone) return;
-      flash(r.ok ? "ok" : "err", t(r.ok ? "video_sent" : r.why === "options" ? "video_off" : r.why === "unnamed" ? "video_unnamed" : "video_failed"));
+      const j = { video, src: video.currentSrc || "", href: location.href, asked: describe(video), started: Date.now(), token: "", count: 0 };
+      job = j;
+      // The menu opens at once, saying it is looking; an answer that needs none and comes first
+      // (no lookups here: the window) shows none.
+      const opening = setTimeout(() => openPicks(j), 100);
+      const s = replyState(await within(send({ type: "video-lookup", ...j.asked }), LOOKUP_MS));
+      clearTimeout(opening);
+      if (!s || !current(j)) return;
+      const a = lookupAction(s, t);
+      // No lookups here, or an answer that isn't one: the click as it was, once.
+      if (a.act === "window") return await useWindow(j);
+      // A video it can't tell, or the button off here: a word on the button, no menu.
+      if (a.act === "flash") {
+        closeMenu();
+        dropLookup();
+        return flash(a.kind, a.text);
+      }
+      openPicks(j);
+      follow(j, s);
     } finally {
       busy = false;
     }
+  }
+
+  // Still the lookup the menu is for: the menu open on the same video (the same element playing
+  // the same thing) on the same page. Whatever answers a lookup after that is dropped.
+  const current = (j) =>
+    job === j && video === j.video && (!j.src || video.currentSrc === j.src) && location.href === j.href;
+
+  function openPicks(j) {
+    if (!current(j) || (menuOpen && panel === picks)) return;
+    closeMenu();
+    panel = picks;
+    menuOpen = true;
+    rows.replaceChildren();
+    said(t("video_looking"));
+    picks.setAttribute("aria-busy", "true");
+    picks.classList.add("open");
+    go.setAttribute("aria-expanded", "true");
+    lastMove = Date.now();
+    position();
+    picks.focus({ preventScroll: true });
+  }
+
+  // The menu's message (plain text), with the app's own words under it.
+  function said(text, detail) {
+    note.textContent = text;
+    if (detail) {
+      const why = document.createElement("span");
+      why.className = "why";
+      why.textContent = String(detail).slice(0, 400);
+      note.append(why);
+    }
+    note.hidden = !text;
+  }
+
+  // The keyboard's focus goes to the menu's new rows while it is in the menu or on the button
+  // (not when it was taken elsewhere meanwhile).
+  const focusHere = () => {
+    const a = shadow.activeElement;
+    return Boolean(a) && (a === go || picks.contains(a));
+  };
+
+  // A message instead of qualities, "Open in…" under it.
+  function say(j, text, detail) {
+    if (!current(j)) return;
+    picks.setAttribute("aria-busy", "false");
+    rows.replaceChildren();
+    said(text, detail);
+    position();
+    if (focusHere()) openRow.focus();
+  }
+
+  // The lookup's end, in the menu (lookupAction).
+  function settle(j, s) {
+    if (!current(j)) return;
+    const a = lookupAction(s, t);
+    if (a.act === "offer") return offer(j, s);
+    if (a.act === "say") return say(j, a.text, a.detail);
+    if (a.act === "flash") {
+      closeMenu();
+      dropLookup();
+      return flash(a.kind, a.text);
+    }
+    // "use-window", "gone" (the app forgot it: restarted) and anything newer: the window.
+    return useWindow(j);
+  }
+
+  // The qualities, a row each: the app's name for it and its size, as text.
+  function offer(j, s) {
+    j.count = Math.min(s.choices.length, 100);
+    j.token = s.token;
+    rows.replaceChildren(
+      ...s.choices.slice(0, j.count).map((choice, i) => {
+        const { name, size } = rowText(choice, lang);
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "pick";
+        b.setAttribute("role", "menuitem");
+        b.dataset.choice = String(i);
+        const n = document.createElement("span");
+        n.className = "name";
+        n.textContent = name;
+        b.append(n);
+        if (size) {
+          const z = document.createElement("span");
+          z.className = "size";
+          z.textContent = size;
+          b.append(z);
+        }
+        return b;
+      }),
+    );
+    said("");
+    picks.setAttribute("aria-busy", "false");
+    // Rows that just pushed "Open in…" down under the pointer aren't picked by a click meant for
+    // it.
+    j.armed = Date.now() + 300;
+    position();
+    if (focusHere()) rows.firstElementChild.focus();
+  }
+
+  // Asks how the lookup is going until it ends (followLookup), then shows what it came to.
+  async function follow(j, first) {
+    const s = await followLookup(first, {
+      ask: (token, ms) => within(send({ type: "video-poll", token }), ms),
+      alive: () => current(j),
+      sleep: (ms) =>
+        new Promise((wake) => {
+          j.wake = wake;
+          j.timer = setTimeout(wake, ms);
+        }),
+      now: Date.now,
+      end: j.started + LOOKUP_MS,
+    });
+    if (!s || !current(j)) return;
+    settle(j, s);
+  }
+
+  // The lookup is no longer wanted (its menu closed): no more questions about it.
+  function dropLookup() {
+    const j = job;
+    job = null;
+    if (!j) return;
+    clearTimeout(j.timer);
+    if (j.wake) j.wake();
+  }
+
+  // A quality picked: the app downloads it (its own choice of it, with what it looked the video
+  // up with) without its window. Only the token and the row's number go.
+  async function pick(j, i) {
+    if (!current(j) || !j.count || j.picked || !(i >= 0 && i < j.count) || Date.now() < j.armed) return;
+    j.picked = true;
+    closeMenu();
+    busy = true;
+    try {
+      const s = replyState(await send({ type: "video-pick", token: j.token, choice: i }));
+      if (!s) return;
+      // Downloading, queued, or handed to the app ("sent"): a word on the button. Anything else
+      // (the lookup forgotten or another window's, an older app): the window.
+      const a = lookupAction(s, t, true);
+      if (a.act === "flash") return flash(a.kind, a.text);
+      return await useWindow(j);
+    } finally {
+      busy = false;
+    }
+  }
+
+  // The click as it always was: the app's Download video window for this video. Once per click.
+  async function useWindow(j) {
+    if (job === j) {
+      closeMenu();
+      dropLookup();
+    }
+    if (!firstWindow(j)) return;
+    // Where the video is now, for the background to ask the page's player there.
+    const r = await send({ type: "video", ...j.asked, ...(j.video.isConnected ? { at: middle(j.video) } : {}) });
+    if (r.gone) return;
+    flash(r.ok ? "ok" : "err", t(r.ok ? "video_sent" : r.why === "options" ? "video_off" : r.why === "unnamed" ? "video_unnamed" : "video_failed"));
+  }
+
+  // A row of the qualities' menu, clicked or by key.
+  function choosePick(b) {
+    const j = job;
+    if (!j || !b) return;
+    if (b.dataset.act === "window") return useWindow(j);
+    if (b.dataset.choice !== undefined) return pick(j, Number(b.dataset.choice));
   }
 
   // A short confirmation on the button itself, then back to normal.
@@ -485,6 +846,8 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
   }
 
   function openMenu() {
+    closeMenu();
+    panel = menu;
     menuOpen = true;
     menu.classList.add("open");
     more.setAttribute("aria-expanded", "true");
@@ -492,11 +855,19 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
     menu.querySelector("button").focus();
   }
 
+  // Closes whichever menu is open; the qualities' takes its lookup with it.
   function closeMenu() {
     if (!menuOpen) return;
+    const back = panel === picks && picks.contains(shadow.activeElement);
     menuOpen = false;
-    menu.classList.remove("open");
+    panel.classList.remove("open");
     more.setAttribute("aria-expanded", "false");
+    if (panel !== picks) return;
+    go.setAttribute("aria-expanded", "false");
+    picks.setAttribute("aria-busy", "false");
+    dropLookup();
+    // The keyboard's focus back on the button, not lost with the menu.
+    if (back) go.focus();
   }
 
   menu.addEventListener("click", (e) => {
@@ -523,22 +894,37 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
     if (act === "settings") send({ type: "options" });
   }
 
-  more.addEventListener("click", () => (menuOpen ? closeMenu() : openMenu()));
+  more.addEventListener("click", () => (menuOpen && panel === menu ? closeMenu() : openMenu()));
 
-  // Keys: Escape closes the menu, arrows move through it.
+  // The qualities' rows: only the user's own clicks.
+  picks.addEventListener("click", (e) => {
+    if (!e.isTrusted) return;
+    choosePick(e.target.closest("button"));
+  });
+
+  // Keys (only the user's own, never ones a page script makes up): Escape closes the open menu
+  // (the keyboard's focus back on its button), arrows move through it, Enter and Space run the
+  // focused command.
   shadow.addEventListener("keydown", (e) => {
+    if (!e.isTrusted) return;
+    const focused = shadow.activeElement;
     if (e.key === "Escape" && menuOpen) {
+      const opener = panel === picks ? go : more;
       closeMenu();
-      more.focus();
+      opener.focus();
       e.stopPropagation();
-    } else if (menuOpen && (e.key === "Enter" || e.key === " ") && menu.contains(shadow.activeElement)) {
+    } else if (menuOpen && (e.key === "Enter" || e.key === " ") && focused && focused !== panel && panel.contains(focused)) {
       // The focused command, whatever the browser does with a key on a button.
-      run(shadow.activeElement.dataset.act);
+      if (panel === picks) choosePick(focused);
+      else run(focused.dataset.act);
       e.preventDefault();
     } else if (menuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
-      const items = [...menu.querySelectorAll("button")];
-      const i = items.indexOf(shadow.activeElement);
-      items[(i + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length].focus();
+      const items = [...panel.querySelectorAll("button")];
+      const i = items.indexOf(focused);
+      const down = e.key === "ArrowDown";
+      // From the menu itself (the qualities' while it looks): the first, or the last.
+      const next = i < 0 ? (down ? 0 : items.length - 1) : (i + (down ? 1 : items.length - 1)) % items.length;
+      items[next]?.focus();
       e.preventDefault();
     }
   });
@@ -618,6 +1004,7 @@ button:focus-visible { outline: 2px solid #2a78d6; outline-offset: -2px; }
   // The extension updated or removed under this page: the button and its listeners go (a fresh
   // copy of this script comes with the new extension).
   function teardown() {
+    dropLookup();
     cancelAnimationFrame(raf);
     cancelAnimationFrame(scan);
     removeEventListener("pointermove", onMove, true);

@@ -485,6 +485,9 @@ These ship in a later version, when they're ready.
   unpacked once and checked against its signed list; built and checked on macOS, still to
   confirm on a person's Mac
 - 🔄 Help: when an antivirus or VirusTotal flags MDM
+- 🔄 The Download video button lists the video's qualities, with their sizes, in a menu on the
+  page: the one picked downloads at once with only its progress window, MDM's main window staying
+  where it is; "Open in Mister Download Manager…" keeps the Download video window: in review
 - 🔄 Linux, what's left ([#164](https://github.com/anefzaoui/misterdownloadmanager/issues/164)):
   screen readers (Orca) reading MDM's windows; browsers installed as a Flatpak (Firefox from
   Flathub may reach MDM through the desktop, as the Snap does: to check); native Wayland windows
@@ -520,6 +523,7 @@ These ship in a later version, when they're ready.
   ([#335](https://github.com/anefzaoui/misterdownloadmanager/issues/335)): fix in review
 - 🔄 A duplicate prompt for a finished file that is gone
   ([#342](https://github.com/anefzaoui/misterdownloadmanager/issues/342)): fix in review
+- 🔄 No size for a stream's qualities (HLS) in the Download video window: fix in review
 - 🔍 A 10-second freeze of the window after a night left open
   ([#304](https://github.com/anefzaoui/misterdownloadmanager/issues/304)): most likely the
   computer waking from sleep; waiting on the reporter's full report

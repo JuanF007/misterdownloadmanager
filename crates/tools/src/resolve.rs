@@ -151,6 +151,17 @@ pub fn parse(json: &[u8]) -> Option<Video> {
     // yt-dlp: "none" means the stream isn't there; a missing codec is just unknown (plain
     // files on generic sites carry both).
     let has = |c: &Option<String>| c.as_deref() != Some("none");
+    // An HLS stream's variants give their bitrate (BANDWIDTH) but no size, though yt-dlp knows
+    // the duration: about bitrate × duration (kbit/s × 125 = bytes/s), as IDM shows it. A live
+    // stream has no duration, and stays without one. Never for a plain file, whose server says
+    // its exact size (`needs_size`, #320).
+    let duration = raw
+        .duration
+        .filter(|d| d.is_finite() && *d > 0.0 && !raw.direct);
+    let estimate = |tbr: Option<f64>| {
+        let tbr = tbr.filter(|t| t.is_finite() && *t > 0.0)?;
+        Some((duration? * tbr * 125.0) as u64)
+    };
     Some(Video {
         title: raw.title.unwrap_or_else(|| "video".into()),
         duration: raw.duration,
@@ -164,7 +175,7 @@ pub fn parse(json: &[u8]) -> Option<Video> {
                 ext: f.ext.unwrap_or_default(),
                 height: f.height,
                 fps: f.fps,
-                size: f.filesize.or(f.filesize_approx),
+                size: f.filesize.or(f.filesize_approx).or_else(|| estimate(f.tbr)),
                 tbr: f.tbr,
             })
             .collect(),
@@ -587,6 +598,41 @@ mod tests {
             {"format_id": "136", "ext": "mp4", "height": 720, "fps": 30, "vcodec": "avc1", "acodec": "none", "filesize": 20000000},
             {"format_id": "299", "ext": "mp4", "height": 1080, "fps": 60, "vcodec": "avc1", "acodec": "none", "filesize_approx": 60000000}
         ]}"#;
+
+    /// An HLS master playlist as yt-dlp reads it (checked with yt-dlp 2026.10.26): each variant's
+    /// bitrate and the duration, no size; sized as bitrate × duration. A live one stays unsized.
+    #[test]
+    fn hls_variants_are_sized_from_their_bitrate() {
+        const HLS: &str = r#"{"title": "master", "duration": 600, "formats": [
+            {"format_id": "800", "ext": "mp4", "height": 360, "tbr": 800.0, "protocol": "m3u8_native"},
+            {"format_id": "2500", "ext": "mp4", "height": 720, "tbr": 2500.0, "protocol": "m3u8_native"}]}"#;
+        let v = parse(HLS.as_bytes()).unwrap();
+        let sizes: Vec<_> = choices(&v, true)
+            .into_iter()
+            .filter(|c| !c.label.starts_with("Audio only"))
+            .map(|c| (c.label, c.size))
+            .collect();
+        assert_eq!(
+            sizes,
+            [
+                ("720p MP4".to_owned(), Some(187_500_000)),
+                ("360p MP4".to_owned(), Some(60_000_000))
+            ]
+        );
+        let live = HLS.replace(r#""duration": 600, "#, "");
+        let v = parse(live.as_bytes()).unwrap();
+        assert!(v.formats.iter().all(|f| f.size.is_none()), "live: no size");
+        // A size yt-dlp gives wins over the estimate.
+        let given = HLS.replace(r#""tbr": 800.0"#, r#""tbr": 800.0, "filesize": 123"#);
+        let v = parse(given.as_bytes()).unwrap();
+        assert_eq!(v.formats[0].size, Some(123));
+        // A plain file's size is its server's to say (#320), never estimated.
+        let direct = HLS.replace(
+            r#""duration": 600, "#,
+            r#""duration": 600, "direct": true, "#,
+        );
+        assert!(parse(direct.as_bytes()).unwrap().needs_size());
+    }
 
     #[test]
     fn choices_with_and_without_merging() {

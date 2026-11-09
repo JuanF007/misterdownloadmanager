@@ -62,6 +62,7 @@ mod tray;
 mod unix;
 mod update;
 mod videodlg;
+mod videolookup;
 mod wake;
 mod whereis;
 #[cfg(windows)]
@@ -104,7 +105,10 @@ pub fn offscreen() -> bool {
 /// open from scripts, and the clipboard belongs to the person at the computer (Add URL's
 /// address came from it, and was fetched).
 pub fn clipboard_text() -> Option<String> {
-    read_clipboard(offscreen(), || {
+    // Nor in unit tests: the person's clipboard isn't theirs, and tests opening a window that
+    // reads it (Download video's) on parallel threads corrupted the heap (Windows' clipboard,
+    // opened from two threads at once).
+    read_clipboard(offscreen() || cfg!(test), || {
         arboard::Clipboard::new().ok()?.get_text().ok()
     })
 }

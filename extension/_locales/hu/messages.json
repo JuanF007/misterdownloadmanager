@@ -188,6 +188,33 @@
   "video_unnamed": {
     "message": "Nem állapítható meg, melyik videóról van szó: nyissa meg a saját oldalát, és próbálja ott"
   },
+  "video_looking": {
+    "message": "Minőségek keresése…"
+  },
+  "video_open_mdm": {
+    "message": "Megnyitás a Mister Download Manager alkalmazásban…"
+  },
+  "video_no_choices": {
+    "message": "Itt nincs letölthető videó"
+  },
+  "video_playlist": {
+    "message": "Videók listája: válassza ki őket a Mister Download Manager alkalmazásban"
+  },
+  "video_no_ytdlp": {
+    "message": "A Mister Download Manager alkalmazásnak szüksége van a yt-dlp eszközre ehhez a videóhoz"
+  },
+  "video_too_long": {
+    "message": "A keresés túl sokáig tartott"
+  },
+  "video_busy": {
+    "message": "A Mister Download Manager alkalmazás más videókkal van elfoglalva"
+  },
+  "video_queued": {
+    "message": "Hozzáadva a sorhoz"
+  },
+  "video_failed_lookup": {
+    "message": "A keresés sikertelen"
+  },
   "popup_send_to": {
     "message": "Letöltések küldése ide"
   },
