@@ -49,6 +49,9 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_LINES: usize = 100_000;
 const MAX_FORMATS: usize = 200;
 const MAX_ATTRIBUTES: usize = 64;
+/// The longest tag line whose attributes are read: a real one is well under 2 KB, and a match
+/// that fails is tried again from later on the line, so a long crafted one costs its square.
+const MAX_ATTRIBUTE_LINE: usize = 16 * 1024;
 
 /// A master playlist, read: its formats as yt-dlp lists them before it knows the duration, its
 /// subtitle languages, and the playlist whose length is the video's ([`Master::first`]).
@@ -325,6 +328,9 @@ fn lines(text: &str) -> Option<Vec<&str>> {
 /// quotes taken off), a later key winning. None for a line with too many.
 fn attributes(line: &str) -> Option<HashMap<String, String>> {
     let b = line.as_bytes();
+    if b.len() > MAX_ATTRIBUTE_LINE {
+        return None;
+    }
     let mut out = HashMap::new();
     let mut found = 0;
     let mut i = 0;
@@ -338,21 +344,32 @@ fn attributes(line: &str) -> Option<HashMap<String, String>> {
                 out.insert(line[key].to_owned(), line[value].to_owned());
                 i = end;
             }
-            None => i += 1,
+            // No match can start inside the key run that just failed (its end and what follows
+            // are the same from any of its letters): on after it.
+            None => i = key_run_end(b, i).max(i + 1),
         }
     }
     Some(out)
+}
+
+/// Where the run of key characters (`[A-Z0-9-]`) starting at `i` ends.
+fn key_run_end(b: &[u8], i: usize) -> usize {
+    let mut j = i;
+    while j < b.len() && key_char(b[j]) {
+        j += 1;
+    }
+    j
+}
+
+fn key_char(c: u8) -> bool {
+    c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'-'
 }
 
 type Span = std::ops::Range<usize>;
 
 /// The attribute the pattern matches at `i`: its key, its value and where the search goes on.
 fn attribute_at(b: &[u8], i: usize) -> Option<(Span, Span, usize)> {
-    let key_char = |c: u8| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'-';
-    let mut j = i;
-    while j < b.len() && key_char(b[j]) {
-        j += 1;
-    }
+    let j = key_run_end(b, i);
     if j == i || b.get(j) != Some(&b'=') {
         return None;
     }
@@ -1116,6 +1133,34 @@ mod tests {
         assert_eq!(resolution("none").ok().flatten(), None);
         assert!(resolution("99999999999x1").is_err());
         assert!(attributes(&"A=1,".repeat(MAX_ATTRIBUTES + 1)).is_none());
+    }
+
+    /// A crafted line can't make the search cost its square: a long run of key characters with
+    /// no `=`, or an unclosed quote again and again, comes back at once (refused when longer
+    /// than any real line), and a line just under the cap is read in linear time.
+    #[test]
+    fn crafted_attribute_lines_cost_no_square() {
+        let t = std::time::Instant::now();
+        for line in [
+            format!("#EXT-X-KEY:{}", "A".repeat(MAX_BYTES)),
+            format!("#EXT-X-KEY:{}", "A=\"".repeat(MAX_BYTES / 3)),
+            format!("#EXT-X-KEY:{}", "A".repeat(MAX_ATTRIBUTE_LINE - 20)),
+            format!(
+                "#EXT-X-KEY:METHOD=AES-128,{}",
+                "B".repeat(MAX_ATTRIBUTE_LINE - 40)
+            ),
+        ] {
+            let _ = attributes(&line);
+        }
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(attributes(&format!("#EXT-X-KEY:{}", "A".repeat(MAX_BYTES))).is_none());
+        // The run's skip changes nothing: a key after a failed run is still found.
+        let a = attributes("#EXT-X-KEY:AAAA BBB-9 METHOD=NONE").unwrap();
+        assert_eq!(a.get("METHOD").map(String::as_str), Some("NONE"));
     }
 
     #[test]
