@@ -8,12 +8,22 @@ Each release's notes on GitHub come from its section here (`## [X.Y.Z]`, see
 ### Added
 
 - **The video's qualities in the page:** a click on the Download video button opens a menu over the video that lists its qualities with their sizes, video and audio in their own tabs (looked up by MDM with yt-dlp). The one you pick downloads at once with only its progress window; MDM's main window stays where it is. **Open in Mister Download Manager…** in the same menu opens the Download video window as before. A stream the page plays (HLS) is listed at once, read by MDM itself; the same video asked again within 10 minutes opens at once; and the pick starts downloading without looking the video up a second time.
+- Options → General → **Customize MDM Download panels in browsers**: Export... and Import... for the sites the download button stays off, a plain text file with one site a line ([#424](https://github.com/anefzaoui/misterdownloadmanager/issues/424)).
 
 ### Fixed
 
 - **Sizes for a stream's qualities:** HLS qualities showed no size; each is now estimated from its bitrate and the video's length, in the Download video window and in the download list.
 - **A video already in the list is no longer downloaded again without a word:** picking the same quality of the same video, from the menu over a video or the Download video window, now follows Options → Downloads ("If a duplicate download link is added": ask, a numbered name, overwrite, or open / resume the one there). Another quality of the same video is not a duplicate.
 - The progress window's bar glides as the download goes, instead of moving in steps four times a second.
+- The window no longer freezes when a video or a gallery finishes: marking its files as downloaded from the web, which can wait on the disk and the antivirus for a while with a big video, now happens beside the window ([#510](https://github.com/anefzaoui/misterdownloadmanager/issues/510)).
+- Linux: **View → Dark Mode support** turns dark on window managers such as Hyprland and sway when only GNOME's setting says so (`gsettings set org.gnome.desktop.interface color-scheme prefer-dark`), as it did when a desktop portal answered ([#324](https://github.com/anefzaoui/misterdownloadmanager/issues/324)).
+- Dark mode no longer draws a bright white line under the menu bar, across the whole window, in the Classic and Native themes ([#379](https://github.com/anefzaoui/misterdownloadmanager/issues/379)).
+- The progress window of a video whose size isn't known says no percentage (it read 0 % in the title and 0.00 % on the Downloaded line), and **File size** stays the file's size at the end (it read 0.1 % too high while yt-dlp finished).
+- A **gofile** share link (`gofile.io/d/...`) now says it is a web page to open in your browser, instead of saving that page as if it were the file ([#346](https://github.com/anefzaoui/misterdownloadmanager/issues/346)).
+- **Download video**: when a site's bot check (Cloudflare) turns yt-dlp away, the message says so and what to try, instead of yt-dlp's cut-off words ([#317](https://github.com/anefzaoui/misterdownloadmanager/issues/317)).
+- The **Download video** window remembers the folder you save into, per **Options → Save to**'s "Change folder for this category on last selected", as **Download File Info** does: it no longer goes back to the Video category's folder each time ([#475](https://github.com/anefzaoui/misterdownloadmanager/issues/475)).
+- X (Twitter) videos sent from the browser's media list are named after the tab, not the random name of their file on X's video server ([#493](https://github.com/anefzaoui/misterdownloadmanager/issues/493)).
+- Windows: **Open folder** on a download opens the folder with the file manager set up to open folders (Directory Opus, for example), instead of always starting Windows Explorer. With Explorer it still selects the file ([#446](https://github.com/anefzaoui/misterdownloadmanager/issues/446)).
 
 ## [0.5.2] - 2026-11-09
 

@@ -26,6 +26,17 @@ const TITLE_H: f32 = if cfg!(windows) {
 /// and its system menu's "Hide to the notification area" (translated, when there is one).
 type Framed = ([f32; 2], u32, Option<String>);
 
+/// The window's title: IDM truncates the percentage in it (44.51 % → "44%"); without a size to
+/// take a share of, only the name. The name keeps its own direction (an Arabic one doesn't pull
+/// the percentage after it).
+fn window_title(frac: Option<f64>, name: &str) -> String {
+    let name = crate::i18n::isolate(name);
+    match frac {
+        Some(f) => format!("{}% {name}", (f * 100.0).floor() as u32),
+        None => name,
+    }
+}
+
 /// The title bar's buttons, from the window's end: Close, Maximize (greyed: a fixed size, as
 /// IDM's), Minimize, and with a tray our "hide to the notification area". None where the system
 /// draws the title bar.
@@ -369,10 +380,8 @@ impl Progress {
 
     pub fn show(&mut self, ctx: &egui::Context, item: &Item, snap: Option<&Snapshot>) -> Action {
         crate::crash::window("progress");
-        let frac = item
-            .size
-            .filter(|t| *t > 0)
-            .map_or(0.0, |t| (item.downloaded as f64 / t as f64).clamp(0.0, 1.0));
+        let frac = item.fraction();
+        let title = window_title(frac, &item.file_name);
         // The bar and the segment map glide between the figures (the text shows them as they
         // are): frames come faster for that only while the download runs and its figures move.
         let segments: Vec<(u64, u64)> = match snap {
@@ -389,17 +398,12 @@ impl Progress {
             &segments,
             item.status == Status::Complete,
         );
-        let bar = item
-            .size
-            .filter(|t| *t > 0)
-            .map_or(0.0, |t| (drawn.done / t as f64).clamp(0.0, 1.0));
-        // IDM truncates the percentage in the title (44.51 % → "44%").
-        // The name keeps its own direction (an Arabic one doesn't pull the percentage after it).
-        let title = format!(
-            "{}% {}",
-            (frac * 100.0).floor() as u32,
-            crate::i18n::isolate(&item.file_name)
-        );
+        // Never past the fraction: a video's bar holds short of the end until it is finished,
+        // as its percentage does ([`Item::fraction`]); no size, no fill.
+        let bar = match (frac, item.size.filter(|t| *t > 0)) {
+            (Some(f), Some(t)) => (drawn.done / t as f64).clamp(0.0, 1.0).min(f),
+            _ => 0.0,
+        };
         let body = if self.details {
             [548.0, 412.0 + torrent_drop(item)]
         } else {
@@ -573,7 +577,7 @@ impl Progress {
         o: Pos2,
         item: &Item,
         snap: Option<&Snapshot>,
-        frac: f64,
+        frac: Option<f64>,
         drawn: (f64, &[(u64, f64)]),
     ) -> Action {
         let p = ui.painter().clone();
@@ -1141,7 +1145,7 @@ const PAGE_TEXT_RIGHT: f32 = 520.0;
 
 // The rows sit 7 px inside the page's frame at the top and at the bottom (the Server row's
 // descent included), with a slightly wider break after Status, as before.
-fn status_page(ui: &Ui, o: Pos2, item: &Item, snap: Option<&Snapshot>, frac: f64) {
+fn status_page(ui: &Ui, o: Pos2, item: &Item, snap: Option<&Snapshot>, frac: Option<f64>) {
     let p = &ui.painter().clone();
     // Long values are cut with "..." at the page edge and shown whole on hover.
     let fit = |key: &str, x: f32, base: f32, s: &str, color| {
@@ -1205,14 +1209,17 @@ fn status_page(ui: &Ui, o: Pos2, item: &Item, snap: Option<&Snapshot>, frac: f64
             crate::i18n::mark("Downloaded"),
             96.0,
             135.0,
-            if crate::i18n::code() == "en" {
-                format!("{} ( {:.2} % )", size3(item.downloaded), frac * 100.0) // not translated: English path (IDM's spacing)
-            } else {
-                format!(
+            match frac {
+                // No size: only how much has come, no 0 % that never moves.
+                None => size3(item.downloaded),
+                Some(frac) if crate::i18n::code() == "en" => {
+                    format!("{} ( {:.2} % )", size3(item.downloaded), frac * 100.0) // not translated: English path (IDM's spacing)
+                }
+                Some(frac) => format!(
                     "{} ( {} )",
                     size3(item.downloaded),
                     crate::i18n::percent(frac, 2)
-                )
+                ),
             },
         ),
         (
@@ -2016,6 +2023,13 @@ fn connections(ui: &mut Ui, p: &egui::Painter, o: Pos2, snap: Option<&Snapshot>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A download of unknown size has no percentage in its title (from #384).
+    #[test]
+    fn the_title_has_a_percentage_only_with_a_size() {
+        assert!(!window_title(None, "clip.mp4").contains('%'));
+        assert!(window_title(Some(0.445), "clip.mp4").starts_with("44% "));
+    }
 
     #[test]
     fn hide_tab_takes_the_tab_off_the_strip() {
