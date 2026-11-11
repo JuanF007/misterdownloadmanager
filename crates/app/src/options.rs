@@ -976,10 +976,15 @@ impl OptionsDialog {
         let Some(&cat) = cats.get(self.category) else {
             return;
         };
-        let default = display_dir(&cat.default_folder(downloads));
+        let base = if cat == Category::General {
+            std::borrow::Cow::Borrowed(downloads)
+        } else {
+            crate::model::default_downloads(downloads, &self.s.category_dirs)
+        };
+        let default = display_dir(&cat.default_folder(&base));
         let typed = self.cat_dir.trim();
         let own = (!typed.is_empty()
-            && typed.trim_end_matches('\\') != default.trim_end_matches('\\'))
+            && typed.trim_end_matches(['\\', '/']) != default.trim_end_matches(['\\', '/']))
         .then(|| typed.to_owned());
         self.s.set_category_dir(cat, own);
     }
@@ -2324,7 +2329,7 @@ impl OptionsDialog {
             reg.week_start = [0, 1, 6][i];
         }
         // What it looks like, now.
-        let now = chrono::Local::now().naive_local();
+        let now = crate::clock::now().naive_local();
         let sample = crate::regional::format_with(crate::regional::effective(reg), now);
         // i18n: label before an example date and time written the chosen way
         let label = crate::i18n::t("Example:");
@@ -2748,10 +2753,8 @@ impl OptionsDialog {
             .map(|r| r.devices())
             .unwrap_or_default();
         let when = |secs: i64| {
-            chrono::DateTime::from_timestamp(secs, 0)
-                .map(|t| {
-                    crate::regional::short_date_time(t.with_timezone(&chrono::Local).naive_local())
-                })
+            crate::clock::local_at(secs)
+                .map(|t| crate::regional::short_date_time(t.naive_local()))
                 .unwrap_or_default()
         };
         let rows: Vec<Vec<String>> = devices

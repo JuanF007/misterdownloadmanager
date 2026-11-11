@@ -312,18 +312,32 @@ fn upper_list(exts: &[String]) -> String {
         .join(" ")
 }
 
+/// The base folder that categories without their own folder live under (#556): General's
+/// folder when one was chosen in Options → Save to, else `downloads`.
+pub fn default_downloads<'a>(
+    downloads: &'a Path,
+    dirs: &'a [(String, String)],
+) -> std::borrow::Cow<'a, Path> {
+    let general = Category::General.key();
+    dirs.iter()
+        .find(|(c, _)| *c == *general)
+        .map(|(_, d)| std::borrow::Cow::Owned(crate::dialogs::resolve_path(d)))
+        .unwrap_or(std::borrow::Cow::Borrowed(downloads))
+}
+
 /// The category's folder: the one chosen in Options → Save to (or remembered from Download
-/// File Info), else the default.
+/// File Info), else the default under [`default_downloads`] (#556).
 pub fn category_folder(cat: Category, downloads: &Path, dirs: &[(String, String)]) -> PathBuf {
+    let base = default_downloads(downloads, dirs);
     if cat.is_custom() {
-        return cat.folder(downloads);
+        return cat.folder(&base);
     }
     let key = cat.key();
     dirs.iter()
         .find(|(c, _)| *c == *key)
         // A folder may be saved as shown, relative to the user's home.
         .map(|(_, d)| crate::dialogs::resolve_path(d))
-        .unwrap_or_else(|| cat.folder(downloads))
+        .unwrap_or_else(|| cat.folder(&base))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -655,7 +669,6 @@ impl Item {
 
     /// The last `n` log entries as tooltip lines ("14:02:11  Connected to …").
     pub fn log_lines(&self, n: usize) -> String {
-        use chrono::TimeZone;
         self.log
             .iter()
             .rev()
@@ -663,9 +676,8 @@ impl Item {
             .rev()
             .map(|(at, text)| {
                 // In the interface's way (English month names in every language before).
-                let t = chrono::Local
-                    .timestamp_opt(*at, 0)
-                    .single()
+                // With the offset of now (crate::clock, #536).
+                let t = crate::clock::local_at(*at)
                     .map(|t| when_text(t.naive_local()))
                     .unwrap_or_default();
                 format!("{t}  {text}")
@@ -975,7 +987,7 @@ impl Item {
 /// The "Last Try Date" and "Added" columns as stored, e.g. `Oct 28 21:44:12 2026` (the list's
 /// format; read back by `stamp_time`).
 pub fn now_stamp() -> String {
-    chrono::Local::now().format(STAMP).to_string()
+    crate::clock::now().format(STAMP).to_string()
 }
 
 const STAMP: &str = "%b %d %H:%M:%S %Y";

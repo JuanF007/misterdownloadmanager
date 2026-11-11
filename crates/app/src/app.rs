@@ -267,6 +267,9 @@ enum Cmd {
     DrawWith(crate::renderer::Api),
     /// View → Interface size → a size in percent (#262).
     InterfaceSize(u16),
+    /// View → Text → Smooth (`true`) or Classic (Windows).
+    #[cfg(windows)]
+    SmoothText(bool),
     /// View → Language: a catalog's code, or follow Windows (`None`).
     Language(Option<&'static str>),
     /// View → Language...: the language picker.
@@ -520,6 +523,31 @@ fn next_trim(done: u32) -> Duration {
 /// before it shows minimized.
 const TRAY_GRACE: Duration = Duration::from_secs(30);
 
+/// How long after the main window loses focus a tray toggle still counts it as in
+/// front (#520): clicking the icon makes the taskbar the foreground window first,
+/// so `focused` is always false by the time Toggle runs on Windows. Unknown focus
+/// (`None`) never counts: unsure means show, never hide.
+const TRAY_TOGGLE_GRACE: Duration = Duration::from_millis(500);
+
+/// Whether a tray left-click hides the window instead of showing it: hidden or
+/// minimized never hides; a focused window does; an unfocused one does only when
+/// it just lost the focus (the click itself took it), else it is behind other
+/// windows and comes forward. Unknown focus never hides.
+fn tray_toggle_hide(
+    hidden: bool,
+    minimized: bool,
+    focused: Option<bool>,
+    since_focused: Option<Duration>,
+) -> bool {
+    if hidden || minimized {
+        return false;
+    }
+    if focused == Some(true) {
+        return true;
+    }
+    focused == Some(false) && since_focused.is_some_and(|d| d < TRAY_TOGGLE_GRACE)
+}
+
 /// Where a start with the session (#226) leaves the window, decided here alone.
 #[derive(Debug, PartialEq)]
 enum AtLogin {
@@ -665,6 +693,11 @@ pub struct App {
     /// Download a gallery (#58).
     gallery_dlg: Option<crate::gallerydlg::GalleryDialog>,
     torrent_dlg: Option<crate::torrentdlg::TorrentDialog>,
+    /// Magnet links and .torrents handed over while Add torrent was open (#507), oldest first:
+    /// each opens in Add torrent when the one before it closes.
+    torrent_waiting: std::collections::VecDeque<(String, Option<crate::torrents::Remote>)>,
+    /// Add torrent closed this frame: the next waiting one opens after a frame without it.
+    torrent_closed: bool,
     torrent_settings: Option<crate::torrentdlg::TorrentSettings>,
     /// Right-click → Torrent → Add trackers… (#39).
     add_trackers: Option<crate::torrentdlg::AddTrackers>,
@@ -741,6 +774,11 @@ pub struct App {
     /// a real exit under way (closing the window otherwise only hides it, as IDM does).
     tray: Option<crate::tray::Tray>,
     tray_limiter: Option<bool>,
+    /// When the main window was last seen focused: a tray click steals the focus first
+    /// (the taskbar becomes foreground), so a click on a frontmost window reads as
+    /// unfocused by the time Toggle runs. Within [`TRAY_TOGGLE_GRACE`] it still counts
+    /// as in front.
+    tray_last_focused: Option<Instant>,
     hidden: bool,
     /// Hidden to the tray: when to hand the window's memory back to the system next (#72), and
     /// how many times it was since the window hid.
@@ -780,6 +818,8 @@ pub struct App {
     last_save: Instant,
     /// Writes the list off the window's thread.
     saver: store::Saver,
+    /// Writes `rss.json` off the window's thread: the feeds' timer saves it by itself (#513).
+    rss_saver: store::Saver,
     /// When the light/dark mode was last checked against Windows' app mode.
     theme_checked: Option<Instant>,
     /// The zoom (View → Interface size, #262) the windows were last drawn at: a change is saved,
@@ -822,8 +862,9 @@ pub struct App {
     /// Stopped by hand while they could have run: a running queue leaves them alone until
     /// they are started again or the queue is started anew (#341).
     stopped_by_hand: std::collections::HashSet<u64>,
-    /// Seconds since local midnight at the last scheduler tick.
-    clock: u32,
+    /// Seconds since local midnight at the last scheduler tick (`None` until the clock's first
+    /// answer, #536).
+    clock: Option<u32>,
     /// Scheduler → "Wake the computer to run this queue": the wake set with the system (#142).
     wake: crate::wake::Waker,
     /// Commands from ipc.rs (command line, second launch, browser).
@@ -1014,12 +1055,6 @@ pub fn auth_headers(login: Option<&(String, String)>) -> HeaderMap {
     h
 }
 
-/// Seconds since local midnight (for queue schedules).
-fn seconds_now() -> u32 {
-    use chrono::Timelike;
-    chrono::Local::now().num_seconds_from_midnight()
-}
-
 /// A read of the clipboard on a thread of its own, its answer taken when it has come (#418).
 struct ClipRead(std::sync::Arc<std::sync::Mutex<Option<Option<String>>>>);
 
@@ -1095,8 +1130,13 @@ fn sort_key(it: &Item, col: usize, queued: bool) -> (f64, String) {
         // Added: the order of addition itself (ids only grow), exact even without a time.
         list::ADDED => (it.id as f64, String::new()),
         list::SOURCE => (f64::from(u8::from(it.torrent.is_some())), String::new()),
-        // A torrent's peers, and its share ratio (not the text: "10" would come before "9").
-        // Anything but a torrent, and a torrent that has taken nothing, sort as zero.
+        // A torrent's upload, its peers, and its share ratio (not the text: "10" would come
+        // before "9"). Anything but a torrent, and a torrent that has taken nothing, sorts as
+        // zero.
+        list::UPLOAD => (
+            it.torrent.as_ref().map_or(0.0, |t| t.up_speed),
+            String::new(),
+        ),
         list::PEERS => (
             it.torrent.as_ref().map_or(0.0, |t| t.peers as f64),
             String::new(),
@@ -1318,6 +1358,8 @@ impl App {
             lookups: Default::default(),
             gallery_dlg: None,
             torrent_dlg: None,
+            torrent_waiting: Default::default(),
+            torrent_closed: false,
             torrent_settings: None,
             add_trackers: None,
             torrent_files: None,
@@ -1363,6 +1405,7 @@ impl App {
             clip_reading: None,
             tray: None,
             tray_limiter: None,
+            tray_last_focused: None,
             // Started with the session (#226): hidden from the first frame.
             hidden: start == crate::Start::Session,
             trim_when_hidden: (start == crate::Start::Session)
@@ -1384,6 +1427,7 @@ impl App {
             secrets_confirmed: 0,
             last_save: Instant::now(),
             saver: store::Saver::new(),
+            rss_saver: store::Saver::writing("rss saver", crate::rss::write),
             theme_checked: None,
             zoom,
             fitted: false,
@@ -1406,7 +1450,7 @@ impl App {
             queues,
             failures: HashMap::new(),
             stopped_by_hand: Default::default(),
-            clock: seconds_now(),
+            clock: None,
             wake: Default::default(),
             commands,
         }
@@ -1624,14 +1668,18 @@ impl App {
                     // i18n: where a download comes from: a web or FTP server (shown on a small colored label)
                     "Web".into()
                 },
-                // A torrent's own numbers (#357): the peers it has, and what it gave back
-                // against what it took (as the progress window's General tab works it out).
+                // A torrent's own numbers (#357), in their slots' order (list::PEERS, RATIO, then
+                // UPLOAD, added last so saved layouts keep their meaning): the peers it has, what
+                // it gave back against what it took (as the General tab works it out), what it sends.
                 it.torrent
                     .as_ref()
                     .map_or(String::new(), |t| crate::i18n::integer(t.peers as u64)),
                 it.torrent.as_ref().map_or(String::new(), |t| {
                     crate::torrents::share_ratio_text(t.uploaded, it.downloaded)
                 }),
+                it.torrent
+                    .as_ref()
+                    .map_or(String::new(), |t| model::rate(t.up_speed)),
             ],
         }
     }
@@ -2037,7 +2085,7 @@ impl App {
             for i in self.items.iter_mut() {
                 i.torrent_check = None;
             }
-            crate::torrents::clear_peers(self.items.iter_mut().filter_map(|i| i.torrent.as_mut()));
+            crate::torrents::clear_live(self.items.iter_mut().filter_map(|i| i.torrent.as_mut()));
             return;
         };
         let limits = self.settings.sharing_limits();
@@ -2052,6 +2100,7 @@ impl App {
                 // Out of the session (released when it finished): no check is running.
                 i.torrent_check = None;
                 spec.peers = 0;
+                spec.up_speed = 0.0;
                 continue;
             };
             // Keep the session's in-memory checking progress visible for stopped/complete
@@ -2066,6 +2115,7 @@ impl App {
             // The peers it has now, for the list's "Peers" column (#357). Not a reason to save:
             // it changes as peers come and go, and the next tick brings the list up to date.
             spec.peers = st.peers_live;
+            spec.up_speed = st.up_speed;
             if st.phase == mdm_torrent::Phase::Finished && dt > 0 {
                 spec.seeded_secs += dt;
                 changed = true;
@@ -2501,16 +2551,12 @@ impl App {
             cmd.url = Some(file);
         }
         // The browser's download button over a video: the Download video window, looking the
-        // page up at once.
+        // page up at once. The main window stays where it is (hidden, minimized): only the
+        // dialog opens, as its window is its own.
         if let Some(page) = cmd.video_page.as_deref() {
-            self.show_window(ctx);
-            let dir = self.settings.category_dir(Category::Video, &self.downloads);
-            crate::videodlg::refresh_ytdlp(&self.rt);
+            self.show_for_dialog(ctx);
             let page = page.to_owned();
-            self.video_dlg = Some(
-                crate::videodlg::VideoDialog::for_page(dir, &page, cmd)
-                    .with_subs(self.settings.video_subs.clone()),
-            );
+            self.video_dlg = Some(self.video_dialog(Some((&page, cmd))));
             return;
         }
         // Its menu: never on this site.
@@ -2522,7 +2568,7 @@ impl App {
         }
         // The browser's right-click menu: a page's (or a selection's) links, to tick in Import.
         if !cmd.links.is_empty() {
-            self.show_window(ctx);
+            self.show_for_dialog(ctx);
             let found = cmd
                 .links
                 .iter()
@@ -2557,7 +2603,7 @@ impl App {
                     && std::path::Path::new(u.trim_matches('"')).is_file())
         }) {
             let m = m.trim().to_owned();
-            self.show_window(ctx);
+            self.show_for_dialog(ctx);
             self.open_torrent_dialog(Some(m), ctx);
             return;
         }
@@ -2585,7 +2631,7 @@ impl App {
         };
         if !cmd.silent && (torrent(&url) || final_url.as_ref().is_some_and(torrent)) {
             let parts = self.request_parts(&url, None, &cmd, crate::debrid::browser_started(&cmd));
-            self.show_window(ctx);
+            self.show_for_dialog(ctx);
             self.open_torrent_dialog_with(
                 Some(url.to_string()),
                 Some(crate::torrents::Remote { url, parts }),
@@ -2701,8 +2747,17 @@ impl App {
                     ua.to_owned()
                 }
             }),
+            // Where the browser's own download of it ended: asked when the link itself is
+            // refused (#630, a one-time or session-bound token the browser already used).
+            browser_final: context
+                .final_url
+                .as_deref()
+                .and_then(|u| url::Url::parse(u).ok())
+                .filter(|f| f != url && mdm_engine::supported(f)),
             post: context.post.clone().map(|body| body.into_bytes().into()),
             on_file_created: Some(mark_hook(url, context.referer.as_deref())),
+            // The browser's own download's type: a web page instead is an error (#533).
+            expected_type: context.mime.clone(),
             ..Options::default()
         };
         RequestParts { headers, opts }
@@ -3135,6 +3190,15 @@ impl App {
         }
     }
 
+    /// Before a handoff's dialog: the main window stays where it is (hidden, minimized) and
+    /// only the dialog opens, as dialogs are windows of their own.
+    fn show_for_dialog(&mut self, ctx: &egui::Context) {
+        let minimized = ctx.input(|i| i.viewport().minimized == Some(true));
+        if !self.hidden && !minimized {
+            self.show_window(ctx);
+        }
+    }
+
     /// Whether the tray icon is shown somewhere (Linux: a tray host is there; asked when the
     /// window is closed, the host may come and go). On Windows and macOS the icon itself is
     /// asked: the shell can accept it and still show nothing, and a window hidden with no icon
@@ -3207,13 +3271,7 @@ impl App {
         let wanted =
             !crate::offscreen() || std::env::var_os("MDM_TEST_TRAY").is_some_and(|v| v == "1");
         if self.tray.is_none() && self.tray_limiter.is_none() && wanted {
-            let icon = crate::app_icon();
-            self.tray = crate::tray::Tray::new(
-                ctx,
-                icon.rgba.clone(),
-                icon.width,
-                self.settings.speed_limit_on,
-            );
+            self.tray = crate::tray::Tray::new(ctx, self.settings.speed_limit_on);
             self.tray_limiter = Some(self.settings.speed_limit_on);
             if self.tray.is_some() {
                 tracing::info!("tray icon shown");
@@ -3244,6 +3302,11 @@ impl App {
             t.set_downloads(&running);
         }
         self.settle_at_login(ctx);
+        // When the window was last focused, for Toggle below. Kept every frame:
+        // by the time a tray click arrives the taskbar already took the focus.
+        if ctx.input(|i| i.viewport().focused) == Some(true) {
+            self.tray_last_focused = Some(Instant::now());
+        }
         let cmds = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
         for c in cmds {
             use crate::tray::TrayCmd;
@@ -3251,6 +3314,30 @@ impl App {
             let cmd = match c {
                 TrayCmd::Show => {
                     self.show_window(ctx);
+                    continue;
+                }
+                TrayCmd::Toggle => {
+                    let minimized = ctx.input(|i| i.viewport().minimized == Some(true));
+                    // Behind other windows it still reads as shown: only hide when
+                    // frontmost, otherwise bring it forward. On Windows the tray
+                    // click itself takes the focus first, so a window focused just
+                    // now still counts as in front (#520).
+                    let focus = ctx.input(|i| i.viewport().focused);
+                    let since_focused = self.tray_last_focused.map(|t| t.elapsed());
+                    // With the icon under the taskbar's ^, the flyout took the focus well
+                    // before the click: Windows is asked whether anything covers the window.
+                    #[cfg(windows)]
+                    let in_front = crate::win32::main_window_in_front() == Some(true);
+                    // Elsewhere focus is all there is to go by (sway, KDE's tray).
+                    #[cfg(not(windows))]
+                    let in_front = false;
+                    if tray_toggle_hide(self.hidden, minimized, focus, since_focused)
+                        || (!self.hidden && !minimized && in_front)
+                    {
+                        self.hide_to_tray(ctx);
+                    } else {
+                        self.show_window(ctx);
+                    }
                     continue;
                 }
                 TrayCmd::AddUrl => Cmd::AddUrl,
@@ -3276,18 +3363,27 @@ impl App {
         // off, no tray at all, or Linux with no tray host (#59: a hidden window couldn't come
         // back, and one that merely minimized could never be closed).
         if !self.exiting && ctx.input(|i| i.viewport().close_requested()) {
-            let keep = self.tray.is_some() && self.settings.close_to_tray;
-            if keep && self.tray_shown_now() {
-                tracing::info!("close: hidden to the notification area");
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.hide_to_tray(ctx);
-            } else if keep && cfg!(not(target_os = "linux")) {
-                tracing::info!("close: no visible tray icon; minimizing to the taskbar");
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            } else {
-                tracing::info!("close: quitting");
-                self.exiting = true;
+            use crate::tray::OnClose;
+            let keep = self.settings.close_to_tray;
+            let tray = self.tray.is_some();
+            // The shell is asked afresh, and only when its answer matters.
+            let shown = keep && tray && self.tray_shown_now();
+            let taskbar = cfg!(not(target_os = "linux"));
+            match crate::tray::on_close(keep, tray, shown, taskbar) {
+                OnClose::Hide => {
+                    tracing::info!("close: hidden to the notification area");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    self.hide_to_tray(ctx);
+                }
+                OnClose::Minimize => {
+                    tracing::info!("close: no visible tray icon; minimizing to the taskbar");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                OnClose::Quit => {
+                    tracing::info!("close: quitting");
+                    self.exiting = true;
+                }
             }
         }
         // Options → General → "Minimize to the notification area" (#63): Minimize hides the
@@ -3462,6 +3558,8 @@ impl App {
                 saved.final_url = url.clone();
                 let _ = saved.write(&state);
             }
+            // Where the browser's download of the old address ended isn't this one's (#630).
+            item.context.final_url = None;
             item.note(crate::i18n::fmt(
                 crate::i18n::t("Address changed to {host}"),
                 &[("host", &crate::i18n::ltr(url.host_str().unwrap_or("?")))],
@@ -3570,6 +3668,22 @@ impl App {
         }
     }
 
+    /// Download video from a page, opened for a page (looked up at once) or from the menu: Save
+    /// to is the Video category's folder, the Music category's while a sound-only choice is
+    /// chosen (#611; not when the user deleted Music).
+    fn video_dialog(&self, page: Option<(&str, mdm_ipc::Command)>) -> crate::videodlg::VideoDialog {
+        crate::videodlg::refresh_ytdlp(&self.rt);
+        let dir = self.settings.category_dir(Category::Video, &self.downloads);
+        let music = (!Category::Music.deleted())
+            .then(|| self.settings.category_dir(Category::Music, &self.downloads));
+        match page {
+            Some((page, cmd)) => crate::videodlg::VideoDialog::for_page(dir, page, cmd),
+            None => crate::videodlg::VideoDialog::new(dir),
+        }
+        .with_subs(self.settings.video_subs.clone())
+        .with_music_folder(music)
+    }
+
     /// Download video from a page → Download Now / Later; or the browser's quality menu's
     /// choice (`from_menu`), which never asks for a queue ([`video_goes`]). Through the
     /// duplicate check first ([`Self::add_video_checked`]).
@@ -3598,7 +3712,7 @@ impl App {
         let id = self.push_item(
             add.page,
             dest,
-            Category::Video,
+            add.category,
             String::new(),
             add.size,
             None,
@@ -3653,16 +3767,27 @@ impl App {
             return VideoLookupAnswer::of(lookup::USE_WINDOW);
         };
         let folder = self.settings.category_dir(Category::Video, &self.downloads);
+        // A sound-only choice saves in Music, as in the Download video window (#611).
+        let music = (!Category::Music.deleted())
+            .then(|| self.settings.category_dir(Category::Music, &self.downloads));
         let start_now = !self.settings.only_add_to_queue;
         let add = self.lookups.pick(pick, cmd.private, now).and_then(|p| {
-            crate::videolookup::video_add(p, &folder, start_now, &self.settings.video_subs)
+            crate::videolookup::video_add(
+                p,
+                &folder,
+                music.as_deref(),
+                start_now,
+                &self.settings.video_subs,
+            )
         });
         let Some(add) = add else {
             return VideoLookupAnswer::of(lookup::USE_WINDOW);
         };
-        // The Video category's folder, made when it isn't there yet (the window asks first; the
+        // Its category's folder, made when it isn't there yet (the window asks first; the
         // choice was made in the browser).
-        let _ = std::fs::create_dir_all(&folder);
+        if let Some(dir) = add.dest.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         // Already in the list in this quality: Options' "If a duplicate download link is added".
         let step = self.add_video_checked(add, true);
         VideoLookupAnswer::of(menu_answer(step, start_now))
@@ -3690,7 +3815,7 @@ impl App {
             let id = self.push_item(
                 page,
                 dest,
-                Category::Video,
+                add.category,
                 String::new(),
                 None,
                 None,
@@ -3730,6 +3855,12 @@ impl App {
         let tool = tools.as_deref().and_then(mdm_tools::installed);
         let ffmpeg = tools.as_deref().and_then(mdm_tools::ffmpeg::installed);
         let rate = self.settings.speed_limit();
+        // A stream in pieces (HLS, DASH): as many at once as a file's connections (#531).
+        let fragments = self
+            .items
+            .iter()
+            .find(|i| i.id == id)
+            .map_or(1, |i| self.settings.connections_for(&i.url));
         let Some(item) = self.item(id) else { return };
         let Some(spec) = item.video.clone() else {
             return;
@@ -3765,6 +3896,7 @@ impl App {
             &folder,
             &stem,
             rate,
+            fragments,
             ffmpeg.as_ref().map(|f| f.exe.as_path()),
             item.size,
             &crate::videodlg::from_browser(&item.context),
@@ -3952,7 +4084,19 @@ impl App {
             self.show_window(ctx);
             return;
         }
-        if self.torrent_dlg.is_some() {
+        if let Some(open) = &self.torrent_dlg {
+            // One Add torrent at a time: a torrent handed over meanwhile waits its turn (#507).
+            // Add torrent… from the menu with it open (no source) has nothing to wait for.
+            if let Some(source) = source
+                && open.source() != source
+                && !self.torrent_waiting.iter().any(|(s, _)| *s == source)
+            {
+                tracing::info!(
+                    "Add torrent is open: a torrent waits ({} waiting)",
+                    self.torrent_waiting.len() + 1
+                );
+                self.torrent_waiting.push_back((source, remote));
+            }
             return;
         }
         self.torrent_dlg = Some(crate::torrentdlg::TorrentDialog::new(
@@ -4123,6 +4267,7 @@ impl App {
                 uploaded: 0,
                 seeded_secs: 0,
                 peers: 0,
+                up_speed: 0.0,
                 upload_limit: None,
                 in_order: add.in_order,
                 ends_first: true,
@@ -4238,13 +4383,19 @@ impl App {
         if save {
             self.save_rss();
         }
+        if let Some(Err(e)) = self.rss_saver.outcome() {
+            tracing::warn!("rss: not saved: {e}");
+        }
     }
 
+    /// On the RSS saver's thread; how it went is logged at the next tick (`rss_tick`).
     fn save_rss(&self) {
-        if let Some(path) = crate::rss::Store::path()
-            && let Err(e) = self.rss.save(&path)
-        {
-            tracing::warn!("rss: {} not saved: {e}", path.display());
+        let Some(path) = crate::rss::Store::path() else {
+            return;
+        };
+        match self.rss.encode() {
+            Ok(json) => self.rss_saver.queue(path, json),
+            Err(e) => tracing::warn!("rss: {} not saved: {e}", path.display()),
         }
     }
 
@@ -5109,24 +5260,29 @@ impl App {
 
     /// Scheduler times, then start what running queues allow (notes/ENGINE.md §5).
     fn tick_queues(&mut self) {
-        use chrono::Datelike;
-        let now_s = seconds_now();
-        let prev = std::mem::replace(&mut self.clock, now_s);
-        let today = chrono::Local::now().date_naive();
-        let weekday = today.weekday().num_days_from_sunday() as usize;
-        let date = (today.year(), today.month(), today.day());
-        for q in 0..self.queues.len() {
-            let sch = self.queues[q].schedule.clone();
-            if let Some(t) = sch.start_at
-                && sch.starts_on(date, weekday)
-                && queue::crossed(t, prev, now_s)
-            {
-                self.queues[q].running = true;
-            }
-            if let Some(t) = sch.stop_at
-                && queue::crossed(t, prev, now_s)
-            {
-                self.stop_queue(q);
+        use chrono::{Datelike, Timelike};
+        // The local time with the offset the clock's thread keeps: asking Windows here held the
+        // window for 8 s (#536). Until its first answer, schedules wait.
+        let local = crate::clock::now_known();
+        let now_s = local.map(|t| t.num_seconds_from_midnight());
+        let prev = std::mem::replace(&mut self.clock, now_s).or(now_s);
+        if let (Some(local), Some(now_s), Some(prev)) = (local, now_s, prev) {
+            let today = local.date_naive();
+            let weekday = today.weekday().num_days_from_sunday() as usize;
+            let date = (today.year(), today.month(), today.day());
+            for q in 0..self.queues.len() {
+                let sch = self.queues[q].schedule.clone();
+                if let Some(t) = sch.start_at
+                    && sch.starts_on(date, weekday)
+                    && queue::crossed(t, prev, now_s)
+                {
+                    self.queues[q].running = true;
+                }
+                if let Some(t) = sch.stop_at
+                    && queue::crossed(t, prev, now_s)
+                {
+                    self.stop_queue(q);
+                }
             }
         }
         let now = Instant::now();
@@ -5415,6 +5571,12 @@ impl App {
             }
             // Every window at once (the frames after this one); saved by `follow_zoom`.
             Cmd::InterfaceSize(percent) => crate::scale::set(ctx, percent),
+            #[cfg(windows)]
+            Cmd::SmoothText(on) => {
+                crate::theme::set_smooth_text(ctx, on);
+                self.settings.smooth_text = on;
+                self.dirty = true;
+            }
             #[cfg(gpu)]
             Cmd::DrawWith(api) => {
                 // Chosen again after it failed here: its next start is tried.
@@ -5503,12 +5665,7 @@ impl App {
             },
             Cmd::VideoPage => {
                 if self.video_dlg.is_none() {
-                    let dir = self.settings.category_dir(Category::Video, &self.downloads);
-                    crate::videodlg::refresh_ytdlp(&self.rt);
-                    self.video_dlg = Some(
-                        crate::videodlg::VideoDialog::new(dir)
-                            .with_subs(self.settings.video_subs.clone()),
-                    );
+                    self.video_dlg = Some(self.video_dialog(None));
                 }
             }
             Cmd::AddMagnet => self.open_torrent_dialog(None, ctx),
@@ -6093,8 +6250,13 @@ impl App {
         {
             menu.insert(at + 1, self.theme_menu());
             menu.insert(at + 2, self.interface_size_menu());
+            #[cfg(windows)]
+            menu.insert(at + 3, self.text_menu());
             #[cfg(gpu)]
-            menu.insert(at + 3, self.draw_with_menu());
+            menu.insert(
+                at + if cfg!(windows) { 4 } else { 3 },
+                self.draw_with_menu(),
+            );
         }
         menu
     }
@@ -6131,6 +6293,8 @@ impl App {
         items.push(Radio("Aero", Cmd::Theme("aero"), true, on("aero")));
         // i18n: View → Theme: a style theme's name (Mac OS X's look), a name: keep "Aqua" as written
         items.push(Radio("Aqua", Cmd::Theme("aqua"), true, on("aqua")));
+        // i18n: View → Theme: a style theme's name (a white canvas, emerald fills, 6-point corners), a name: keep "Emerald" as written
+        items.push(Radio("Emerald", Cmd::Theme("emerald"), true, on("emerald")));
         let wal = crate::themefile::PYWAL;
         for e in self.theme_list.iter().filter(|e| e.path.is_some()) {
             if !files {
@@ -6170,6 +6334,20 @@ impl App {
             .collect();
         // i18n: View menu: submenu choosing how large MDM draws its windows and text (100 % to 200 %), as a browser's zoom
         MenuEntry::Sub("&Interface size", true, items)
+    }
+
+    /// View → Text (Windows): how the letters are drawn. Smooth is DirectWrite's natural look
+    /// (any size, each letter where it falls: easy to read on a dense screen); Classic is the
+    /// hinted whole-pixel look of Windows' old controls. Applies at once.
+    #[cfg(windows)]
+    fn text_menu(&self) -> MenuEntry<Cmd> {
+        let smooth = self.settings.smooth_text;
+        // i18n: View → Text: letters drawn smooth, as Windows' modern apps draw them, anti-aliased at any size
+        let a = MenuEntry::Radio("&Smooth", Cmd::SmoothText(true), true, smooth);
+        // i18n: View → Text: letters drawn the classic way, hinted to whole pixels (crisp, coarse on a dense screen)
+        let b = MenuEntry::Radio("&Classic", Cmd::SmoothText(false), true, !smooth);
+        // i18n: View menu: submenu choosing how the text is drawn (smooth or classic)
+        MenuEntry::Sub("&Text", true, vec![a, b])
     }
 
     /// View → Draw with (#89, #206): OpenGL or the system's own graphics API (Direct3D on
@@ -8430,7 +8608,7 @@ impl App {
             }
         }
         if let Some(d) = &mut self.add_url {
-            let out = d.show(ctx);
+            let out = d.show(ctx, |url| self.settings.site_login(url));
             // Every address that goes on is remembered for the Address drop list.
             if let Outcome::Done(new) = &out {
                 crate::settings::remember(&mut self.settings.url_history, new.url.as_str());
@@ -8461,16 +8639,8 @@ impl App {
                 // A video's page, not a file (YouTube, Vimeo…): the video window looks it up.
                 Outcome::Done(new) if mdm_tools::pages::is_video_page(&new.url) => {
                     self.add_url = None;
-                    let dir = self.settings.category_dir(Category::Video, &self.downloads);
-                    crate::videodlg::refresh_ytdlp(&self.rt);
-                    self.video_dlg = Some(
-                        crate::videodlg::VideoDialog::for_page(
-                            dir,
-                            new.url.as_str(),
-                            Default::default(),
-                        )
-                        .with_subs(self.settings.video_subs.clone()),
-                    );
+                    self.video_dlg =
+                        Some(self.video_dialog(Some((new.url.as_str(), Default::default()))));
                 }
                 // An image gallery's page (Wikimedia Commons, Flickr…): gallery-dl (#58).
                 Outcome::Done(new) if mdm_tools::pages::is_gallery_page(&new.url) => {
@@ -8735,14 +8905,43 @@ impl App {
         if let Some((id, (files, all, size))) = torrent_files_selection {
             self.choose_files(id, files, all, size);
         }
+        // The next torrent handed over while Add torrent was open (#507), a frame after it
+        // closed: that frame without it closes its window, and the next one opens as a window
+        // of its own (opened in the same frame, the closed window would only change its
+        // contents). One that goes to the debrid account opens nothing, and the one after it
+        // is next.
+        if self.torrent_dlg.is_none() && !self.torrent_waiting.is_empty() {
+            if std::mem::take(&mut self.torrent_closed) {
+                ctx.request_repaint();
+            } else {
+                while self.torrent_dlg.is_none()
+                    && let Some((source, remote)) = self.torrent_waiting.pop_front()
+                {
+                    self.open_torrent_dialog_with(Some(source), remote, ctx);
+                }
+            }
+        }
         if let Some(t) = &mut self.torrent_dlg {
-            match t.show(ctx, &self.rt) {
-                Outcome::Open => {}
-                Outcome::Closed => self.torrent_dlg = None,
+            let closed = match t.show(ctx, &self.rt) {
+                Outcome::Open => false,
+                Outcome::Closed => true,
                 Outcome::Done(add) => {
+                    if self.settings.change_folder_on_last
+                        && self
+                            .settings
+                            .keep_category_dir(add.category, &add.dir, &self.downloads)
+                    {
+                        self.dirty = true;
+                    }
                     self.torrent_dlg = None;
                     self.add_torrent(add);
+                    true
                 }
+            };
+            if closed {
+                self.torrent_dlg = None;
+                self.torrent_closed = true;
+                ctx.request_repaint();
             }
         }
         if let Some(g) = &mut self.gallery_dlg {
@@ -8761,10 +8960,11 @@ impl App {
                 Outcome::Closed => self.video_dlg = None,
                 Outcome::Done(out) => {
                     // Options' "Change folder for this category on last selected", which
-                    // Download File Info follows through its box (#475).
+                    // Download File Info follows through its box (#475): Music's for a
+                    // sound-only choice (#611).
                     if self.settings.change_folder_on_last
                         && self.settings.keep_category_dir(
-                            Category::Video,
+                            v.category(),
                             &v.save_folder(),
                             &self.downloads,
                         )
@@ -8845,6 +9045,9 @@ impl App {
         }
         if let Some(mut fi) = self.file_info.take() {
             self.start_early(&mut fi);
+            // The downloads waiting their turn behind this one (a browser selection's arrive
+            // one by one): Cancel asks whether they are cancelled too (#394).
+            fi.waiting = self.file_info_waiting.len();
             let out = fi.show(ctx, &mut self.icons);
             if std::mem::take(&mut fi.new_category) {
                 self.category_for_file_info = true;
@@ -8875,6 +9078,12 @@ impl App {
             match out {
                 Outcome::Open => self.file_info = Some(fi),
                 Outcome::Closed => {
+                    if fi.cancel_all {
+                        // #394: "Yes" to "Cancel them too?": the browser's links waiting
+                        // behind this one are cancelled with it (the browser gave its own copy
+                        // up, and Download File Info was their step).
+                        self.file_info_waiting.clear();
+                    }
                     if let Some(id) = fi.early {
                         self.stop(id);
                         self.after_stop.push((id, None));
@@ -9249,6 +9458,8 @@ impl Drop for App {
         // No wake for a queue MDM won't be there to start (Linux's alarm would outlive it).
         self.wake.clear();
         self.keep_unseen();
+        // The feeds as last handed to their saver.
+        self.rss_saver.flush();
         // What the saver has in hand first, then the last state, written here and now.
         self.saver.flush();
         let _ = store::save(
@@ -9478,6 +9689,42 @@ mod at_login_tests {
 }
 
 #[cfg(test)]
+mod tray_toggle_tests {
+    use super::{TRAY_TOGGLE_GRACE, tray_toggle_hide};
+    use std::time::Duration;
+
+    /// Left click toggles: hidden or minimized shows; frontmost hides; behind
+    /// shows; a click that just took the focus (Windows) still hides (#520).
+    #[test]
+    fn only_a_frontmost_window_hides() {
+        let ms = Duration::from_millis;
+        // Hidden or minimized: always shows.
+        assert!(!tray_toggle_hide(true, false, Some(false), None));
+        assert!(!tray_toggle_hide(false, true, Some(true), None));
+        // Frontmost: hides.
+        assert!(tray_toggle_hide(false, false, Some(true), None));
+        // Behind other windows: shows.
+        assert!(!tray_toggle_hide(
+            false,
+            false,
+            Some(false),
+            Some(TRAY_TOGGLE_GRACE + ms(1))
+        ));
+        assert!(!tray_toggle_hide(false, false, Some(false), None));
+        // The click stole the focus just now (Windows): still hides.
+        assert!(tray_toggle_hide(
+            false,
+            false,
+            Some(false),
+            Some(TRAY_TOGGLE_GRACE - ms(1))
+        ));
+        // Unknown focus: unsure means show, never hide.
+        assert!(!tray_toggle_hide(false, false, None, None));
+        assert!(!tray_toggle_hide(false, false, None, Some(Duration::ZERO)));
+    }
+}
+
+#[cfg(test)]
 mod global_cap_tests {
     use super::share;
 
@@ -9629,6 +9876,7 @@ mod duplicate_tests {
             page: page(),
             selector: SELECTOR.into(),
             dest: PathBuf::from("Clip.mp4"),
+            category: Category::Video,
             size: None,
             start_now: true,
             context: Default::default(),
@@ -9872,6 +10120,7 @@ mod duplicate_tests {
             d,
             "Clip",
             None,
+            1,
             None,
             None,
             &Default::default(),

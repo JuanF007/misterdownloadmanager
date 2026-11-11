@@ -278,6 +278,8 @@ impl Master {
                     .filter(|t| t.is_finite() && *t > 0.0)
                     .map(|t| crate::resolve::estimate(duration, t)),
                 tbr: f.tbr,
+                // A variant of an HLS playlist: its pieces need ffmpeg to make one file (#569).
+                hls: true,
             })
             .collect();
         if !ties_are_harmless(&formats) {

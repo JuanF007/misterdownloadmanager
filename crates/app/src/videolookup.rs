@@ -463,20 +463,33 @@ fn answer(token: &str, s: &Search) -> VideoLookupAnswer {
     }
 }
 
-/// The download choice `p` adds, into `folder` (the Video category's): MDM's own selector for
-/// it, the file named as the Download video window names it, the subtitles that window would
-/// preselect from `pref` (settings.video_subs, not changed by it), started now unless
-/// `start_now` is false (Options: only add to the queue), from the look-up's own yt-dlp answer
-/// (its first run). None for an address MDM can't take.
-pub fn video_add(p: Picked, folder: &Path, start_now: bool, pref: &Subs) -> Option<VideoAdd> {
+/// The download choice `p` adds, into `folder` (the Video category's), or `music` (the Music
+/// category's, None when the user deleted it) for a sound-only choice, listed under that category
+/// as the Download video window does (#611): MDM's own selector for it, the file named as the
+/// Download video window names it, the subtitles that window would preselect from `pref`
+/// (settings.video_subs, not changed by it), started now unless `start_now` is false (Options:
+/// only add to the queue), from the look-up's own yt-dlp answer (its first run). None for an
+/// address MDM can't take.
+pub fn video_add(
+    p: Picked,
+    folder: &Path,
+    music: Option<&Path>,
+    start_now: bool,
+    pref: &Subs,
+) -> Option<VideoAdd> {
     let page = url::Url::parse(&p.address)
         .ok()
         .filter(|u| matches!(u.scheme(), "http" | "https"))?;
     let name = crate::videodlg::file_name(title_of(&p.video, &p.address, &p.context), &p.choice);
+    let (category, folder) = match music {
+        Some(m) if mdm_tools::resolve::is_audio(&p.choice) => (crate::model::Category::Music, m),
+        _ => (crate::model::Category::Video, folder),
+    };
     Some(VideoAdd {
         page,
         selector: p.choice.selector.clone(),
         dest: folder.join(mdm_engine::naming::sanitize(name.trim())),
+        category,
         size: p.choice.size,
         start_now,
         subs: crate::videodlg::default_subs(&p.video, &p.choice, pref),
@@ -1274,7 +1287,7 @@ mod tests {
         answered(&job, STREAM);
         let p = l.pick(&pick(&job.token, 0, None), false, now).unwrap();
         drop(job);
-        let add = video_add(p, &folder, true, &de).unwrap();
+        let add = video_add(p, &folder, None, true, &de).unwrap();
         assert_eq!(add.page.as_str(), SRC);
         assert_eq!(
             add.selector, "b[height=720]",
@@ -1308,7 +1321,7 @@ mod tests {
             langs: vec!["ja".into()],
             ..Default::default()
         };
-        let add = video_add(p, &folder, false, &ja).unwrap();
+        let add = video_add(p, &folder, None, false, &ja).unwrap();
         assert_eq!(add.dest, folder.join("master.mp4"));
         assert_eq!(add.selector, "b[height=360]");
         assert!(!add.start_now);
@@ -1329,7 +1342,7 @@ mod tests {
         );
         let p = l.pick(&pick(&job.token, 0, None), false, now).unwrap();
         drop(job);
-        let add = video_add(p, &folder, true, &Subs::default()).unwrap();
+        let add = video_add(p, &folder, None, true, &Subs::default()).unwrap();
         assert_eq!(add.dest, folder.join("Its own title.mp4"));
         // Never an address that isn't on the web.
         let job = l
@@ -1342,6 +1355,6 @@ mod tests {
             .unwrap();
         answered(&job, STREAM);
         let p = l.pick(&pick(&job.token, 0, None), false, now).unwrap();
-        assert!(video_add(p, &folder, true, &Subs::default()).is_none());
+        assert!(video_add(p, &folder, None, true, &Subs::default()).is_none());
     }
 }

@@ -10,8 +10,8 @@ only, and yt-dlp's own answer for it:
 - `ytdlp.json`: yt-dlp's answer, trimmed to what `resolve::parse` reads: `title`, `duration`,
   `direct`, `language`; `subtitles` and `automatic_captions` with each file's `name` only (none
   here); and of each format `format_id`, `ext`, `height`, `fps`, `vcodec`, `acodec`, `filesize`,
-  `filesize_approx`, `tbr` (each kept only where yt-dlp gave it, nulls included). Formats keep
-  yt-dlp's order.
+  `filesize_approx`, `tbr`, `protocol` (each kept only where yt-dlp gave it, nulls included).
+  Formats keep yt-dlp's order.
 
 yt-dlp **2026.10.26** (the Windows `yt-dlp.exe` MDM installs), on 2026-11-09. Each case ran
 

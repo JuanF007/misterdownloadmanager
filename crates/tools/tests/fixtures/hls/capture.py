@@ -150,7 +150,7 @@ CASES = [
 # What resolve::parse reads of yt-dlp's answer.
 TOP = ['title', 'duration', 'direct', 'language']
 SUBS = ['subtitles', 'automatic_captions']
-FORMAT = ['format_id', 'ext', 'height', 'fps', 'vcodec', 'acodec', 'filesize', 'filesize_approx', 'tbr']
+FORMAT = ['format_id', 'ext', 'height', 'fps', 'vcodec', 'acodec', 'filesize', 'filesize_approx', 'tbr', 'protocol']
 
 
 def trim(info):

@@ -192,9 +192,21 @@ fn fake_ytdlp() -> ExitCode {
         let file = template.replace("%(ext)s", &format!("{lang}.srt"));
         std::fs::write(file, "1\n00:00:00,000 --> 00:00:01,000\nHello\n").unwrap();
     }
+    // #569: the format asked for, for the checks.
+    std::fs::write(dir.join("format.txt"), &format).unwrap();
     if !has("--skip-download") {
         let video = template.replace("%(ext)s", "mp4").replace("%%", "%");
-        std::fs::write(&video, vec![0u8; 4096]).unwrap();
+        // #569: YouTube's HLS sound joined without ffmpeg, as yt-dlp leaves it: pieces each led
+        // by an ID3 tag, then raw AAC (ADTS) frames, under the format's `.mp4` name.
+        let content = if mode == "hls-audio" {
+            let mut piece = b"ID3     ".to_vec();
+            piece.extend([0u8; 16]);
+            piece.extend([0xff, 0xf1, 0x50, 0x80, 0x2e, 0x7f, 0xfc]);
+            piece.repeat(64)
+        } else {
+            vec![0u8; 4096]
+        };
+        std::fs::write(&video, content).unwrap();
         if mode == "odd-lines" {
             // The path in a one-byte code page: every letter beyond ASCII one byte, not UTF-8.
             let mut line = b"MDMF ".to_vec();
@@ -293,6 +305,7 @@ fn download_as(
         out.path(),
         stem,
         None,
+        1,
         None,
         None,
         &Default::default(),
@@ -339,6 +352,23 @@ fn job_checks(me: &Path) {
         other => panic!("odd lines: {other:?}"),
     }
     assert_eq!(files, ["Şirin ğüş.mp4"]);
+
+    // #569: no ffmpeg (none given here), the sound alone: yt-dlp is asked for one that comes as
+    // a file first, and what it joined from HLS pieces is saved for what it is, raw AAC.
+    let (p, files, out) = download_as(me, "hls-audio", &none, "ba", "Talk");
+    match &p.state {
+        State::Done(f) => assert_eq!(f.file_name().unwrap().to_string_lossy(), "Talk.aac"),
+        other => panic!("hls audio: {other:?}"),
+    }
+    assert_eq!(files, ["Talk.aac"]);
+    assert_eq!(
+        std::fs::read_to_string(out.path().join("format.txt")).unwrap(),
+        "ba[protocol!*=m3u8]/ba"
+    );
+    // A file that is what it's named: as it is.
+    let (p, files, _o) = download_as(me, "", &none, "ba", "Talk");
+    assert!(matches!(p.state, State::Done(_)), "plain: {:?}", p.state);
+    assert_eq!(files, ["Talk.mp4"]);
 
     // It falls over mid-way: the failure is told, and what it left running is ended with it
     // (Windows: the job; elsewhere yt-dlp is one process, so there's no child to leave).
@@ -417,6 +447,7 @@ fn preloaded_checks(me: &Path) {
             out.path(),
             "Talk",
             None,
+            1,
             None,
             None,
             &Default::default(),

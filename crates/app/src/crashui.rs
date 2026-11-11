@@ -91,6 +91,7 @@ pub fn monitor_main(m: MonitorArgs) -> eframe::Result {
     // And its interface size (#262): the window is made before the zoom applies, so its size is
     // given zoomed (brought inside the screen at its first frame).
     let zoom = crate::scale::startup(settings.interface_size);
+    crate::theme::init_smooth_text(settings.smooth_text);
     let builder = crate::quiet(
         ViewportBuilder::default()
             .with_title(crate::i18n::t("Mister Download Manager crash report"))
@@ -382,7 +383,7 @@ impl ReportWindow {
 
         // The app's icon and the heading.
         let icon = self.icon.get_or_insert_with(|| {
-            let i = crate::app_icon();
+            let i = crate::app_picture();
             let img = egui::ColorImage::from_rgba_unmultiplied(
                 [i.width as usize, i.height as usize],
                 &i.rgba,

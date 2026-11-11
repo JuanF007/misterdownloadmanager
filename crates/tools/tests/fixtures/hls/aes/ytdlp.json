@@ -10,7 +10,8 @@
    "fps": null,
    "vcodec": "avc1.42e01e",
    "acodec": "mp4a.40.2",
-   "tbr": 600.0
+   "tbr": 600.0,
+   "protocol": "m3u8_native"
   },
   {
    "format_id": "1500",
@@ -19,7 +20,8 @@
    "fps": null,
    "vcodec": "avc1.4d401f",
    "acodec": "mp4a.40.2",
-   "tbr": 1500.0
+   "tbr": 1500.0,
+   "protocol": "m3u8_native"
   }
  ]
 }

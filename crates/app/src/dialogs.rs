@@ -444,9 +444,12 @@ fn dialog_window<T>(
         crate::theme::dark_surface(),
         matches!(out, Outcome::Open),
     );
-    // A question takes the focus once it is shown (not while hidden for its theme).
+    // A question takes the focus once it is shown (not while hidden for its theme), and so does
+    // Download File Info outside Windows (#484): asked for from the browser, it opened behind
+    // it. Windows lifts it in keep_theme instead.
     let focused = key.with("focus-sent");
-    if modal && matches!(out, Outcome::Open) && !crate::offscreen() {
+    let takes_focus = modal || (cfg!(not(windows)) && id == "file-info");
+    if takes_focus && matches!(out, Outcome::Open) && !crate::offscreen() {
         let shown = ctx.data(|d| d.get_temp::<bool>(key.with("shown")).unwrap_or(false));
         if shown && !ctx.data(|d| d.get_temp::<bool>(focused).unwrap_or(false)) {
             ctx.send_viewport_cmd_to(ViewportId::from_hash_of(id), egui::ViewportCommand::Focus);
@@ -596,6 +599,10 @@ pub struct AddUrl {
     /// The addresses entered before, newest first (the Address drop list).
     history: Vec<String>,
     list_open: bool,
+    /// The address Options → Sites Logins was last looked up for, and the login it gave
+    /// (#511): "Use authorization" shows it while the box is left as it was filled.
+    looked_up: String,
+    filled: Option<(String, String)>,
 }
 
 pub struct NewUrl {
@@ -620,7 +627,44 @@ impl AddUrl {
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context) -> Outcome<NewUrl> {
+    /// "Use authorization" shows the Sites Logins entry the download will use for the address
+    /// (#511): `site_login` is that same match (`Settings::site_login`). A login typed or
+    /// changed in the box is left alone; one filled from Options follows the address.
+    fn follow_site_login(&mut self, site_login: impl Fn(&Url) -> Option<(String, String)>) {
+        if self.looked_up == self.address {
+            return;
+        }
+        self.looked_up.clone_from(&self.address);
+        let found = crate::model::parse_address(&self.address)
+            .ok()
+            .and_then(|u| site_login(&u));
+        if found == self.filled {
+            return;
+        }
+        let as_filled = match &self.filled {
+            Some((user, pass)) => self.auth && self.login == *user && self.password == *pass,
+            None => !self.auth && self.login.is_empty() && self.password.is_empty(),
+        };
+        if as_filled {
+            self.auth = found.is_some();
+            (self.login, self.password) = found.clone().unwrap_or_default();
+        }
+        self.filled = found;
+    }
+
+    /// The login OK hands on: none while the box shows the Sites Logins entry as it was filled,
+    /// so the download keeps following Options, as it does without one.
+    fn typed_login(&self) -> Option<(String, String)> {
+        let own = (self.login.clone(), self.password.clone());
+        (self.auth && self.filled.as_ref() != Some(&own)).then_some(own)
+    }
+
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        site_login: impl Fn(&Url) -> Option<(String, String)>,
+    ) -> Outcome<NewUrl> {
+        self.follow_site_login(site_login);
         window(
             ctx,
             "add-url",
@@ -780,9 +824,7 @@ impl AddUrl {
                         Ok(url) if mdm_engine::supported(&url) || url.scheme() == "magnet" => {
                             return Outcome::Done(NewUrl {
                                 url,
-                                login: self
-                                    .auth
-                                    .then(|| (self.login.clone(), self.password.clone())),
+                                login: self.typed_login(),
                             });
                         }
                         _ => self.error = Some(crate::i18n::t("Invalid address").into()),
@@ -836,6 +878,14 @@ pub struct FileInfo {
     folders_open: bool,
     /// "+" was clicked: the app opens the new-category window.
     pub new_category: bool,
+    /// The downloads waiting their turn behind this one (a browser selection's arrive one by
+    /// one): Cancel asks whether they are cancelled too (#394). The app sets it each frame.
+    pub waiting: usize,
+    /// Cancel was pressed while some waited: the question is up, this dialog waits for it.
+    cancel_ask: bool,
+    /// The question's answer was Yes: the waiting ones are cancelled with this one (`Closed`
+    /// comes with it; the app clears the waiting ones).
+    pub cancel_all: bool,
     /// The debrid accounts (#44): which one this address goes through, if any.
     route: crate::debrid::Route,
     /// The account that takes the address ("Real-Debrid (labuser)"), as last looked at: the
@@ -926,6 +976,9 @@ impl FileInfo {
             folders: Vec::new(),
             folders_open: false,
             new_category: false,
+            waiting: 0,
+            cancel_ask: false,
+            cancel_all: false,
             route,
             through,
             direct,
@@ -992,6 +1045,7 @@ impl FileInfo {
                 self.context.post = None;
                 self.context.post_type = None;
                 self.request.opts.post = None;
+                self.request.opts.browser_final = None;
                 self.request.headers.remove(reqwest::header::CONTENT_TYPE);
                 // Another address isn't the download the browser had started: it goes through
                 // the debrid account that takes its host (#44), unless the user unticked it.
@@ -1079,7 +1133,30 @@ impl FileInfo {
             .map(Path::to_path_buf)
             .unwrap_or_default();
         let out = self.dialog(ctx, icons);
-        ensure_folder(ctx, &mut self.asking, out, &folder)
+        let out = ensure_folder(ctx, &mut self.asking, out, &folder);
+        // #394: more downloads wait their turn behind this one (the browser's selected links):
+        // Cancel (the button, Escape, the window's ×) asks whether they are cancelled too.
+        if matches!(out, Outcome::Closed) && self.waiting > 0 && !self.cancel_ask {
+            self.cancel_ask = true;
+        }
+        if self.cancel_ask {
+            // The question answers for the dialog: a Start pressed meanwhile waits for it, as
+            // with the Create folder question.
+            return match cancel_waiting(ctx, self.waiting) {
+                Outcome::Done(all) => {
+                    self.cancel_ask = false;
+                    self.cancel_all = all;
+                    Outcome::Closed
+                }
+                // The question's own ×: as No, this one alone is skipped.
+                Outcome::Closed => {
+                    self.cancel_ask = false;
+                    Outcome::Closed
+                }
+                Outcome::Open => Outcome::Open,
+            };
+        }
+        out
     }
 
     fn dialog(
@@ -1511,6 +1588,68 @@ impl FileInfo {
     }
 }
 
+/// Cancel in Download File Info while more downloads wait their turn behind it (#394): are
+/// those cancelled too? `Done(true)`: yes; `Done(false)`: this one alone is skipped.
+fn cancel_waiting(ctx: &egui::Context, n: usize) -> Outcome<bool> {
+    let extra = grow_extra(ctx, "cancel-waiting");
+    question(
+        ctx,
+        "cancel-waiting",
+        "Mister Download Manager",
+        [374.0, 100.0 + extra],
+        false,
+        winui::BG(),
+        |ui, o| {
+            let p = ui.painter().clone();
+            let text = crate::i18n::fmt(
+                // i18n: Cancel in Download File Info with downloads waiting behind it
+                &crate::i18n::tn(
+                    n as u64,
+                    "There is {n} more download waiting. Cancel it too?",
+                    "There are {n} more downloads waiting. Cancel them too?",
+                ),
+                &[("n", &crate::i18n::integer(n as u64))],
+            );
+            let lines = winui::paragraph(
+                &p,
+                o.x + 11.0,
+                o.y + 21.0,
+                &text,
+                winui::TEXT(),
+                o.x + 362.0,
+                13.0,
+            );
+            grow_to(ui.ctx(), "cancel-waiting", lines, 2);
+            let o = o + vec2(0.0, extra);
+            let yes = winui::button(
+                ui,
+                r(o, 94.0, 63.0, 73.0, 21.0),
+                "Yes",
+                ButtonKind::Default,
+                false,
+                None,
+            )
+            .clicked();
+            let no = winui::button(
+                ui,
+                r(o, 207.0, 63.0, 73.0, 21.0),
+                "No",
+                ButtonKind::Normal,
+                false,
+                None,
+            )
+            .clicked();
+            if no || winui::escape_pressed(ui) {
+                Outcome::Done(false)
+            } else if yes || winui::enter_pressed(ui) {
+                Outcome::Done(true)
+            } else {
+                Outcome::Open
+            }
+        },
+    )
+}
+
 /// Look `url` up in the background (name, size) as the download will ask it (`request`), the
 /// answer landing in the slot returned.
 /// A look's result: what it learned, and its open answer when the download can read it.
@@ -1710,8 +1849,16 @@ impl Complete {
                 }
 
                 // Enter: Open, the default button (as in the other dialogs).
+                // The keys of a drag out of the grip are the drag's (Escape cancels it), not
+                // this window's (#561: the drag runs beside the window, which sees them too).
+                #[cfg(windows)]
+                let dragging = crate::win32::dragging_out();
+                #[cfg(not(windows))]
+                let dragging = false; // the grip is Windows-only
                 // A file that can't open says why (the box stays for Open folder).
-                if (open.clicked() || winui::enter_pressed(ui)) && open_file(&self.path) {
+                if (open.clicked() || (!dragging && winui::enter_pressed(ui)))
+                    && open_file(&self.path)
+                {
                     Outcome::Done(())
                 } else if with.clicked() {
                     open_with(&self.path);
@@ -1719,7 +1866,7 @@ impl Complete {
                 } else if folder.clicked() {
                     show_in_folder(&self.path);
                     Outcome::Done(())
-                } else if close.clicked() || winui::escape_pressed(ui) {
+                } else if close.clicked() || (!dragging && winui::escape_pressed(ui)) {
                     Outcome::Done(())
                 } else {
                     Outcome::Open
@@ -1976,7 +2123,7 @@ pub struct LimitNotice {
 
 impl LimitNotice {
     pub fn new(mb: u32, hours: u32, wait: std::time::Duration) -> Self {
-        let at = chrono::Local::now()
+        let at = crate::clock::now()
             + chrono::Duration::from_std(wait).unwrap_or_else(|_| chrono::Duration::zero());
         LimitNotice {
             lines: [
@@ -3157,6 +3304,64 @@ mod tests {
         assert!(!pass(true));
     }
 
+    /// #394: the question's answers: Enter ("Yes", the default) cancels the waiting ones too,
+    /// Escape ("No") skips this one alone, and with no answer nothing is decided.
+    #[test]
+    fn cancel_waiting_answers_enter_escape_and_nothing() {
+        // The key a pass presses, delivered to the window that renders the question (a
+        // thread-local: the renderer is global, and another test's window must see no key).
+        thread_local! {
+            static KEY: std::cell::Cell<Option<egui::Key>> = const { std::cell::Cell::new(None) };
+        }
+        egui::Context::set_immediate_viewport_renderer(move |ctx, viewport| {
+            let events = KEY.with(|k| {
+                k.take().map(|key| {
+                    vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::default(),
+                    }]
+                })
+            });
+            let input = egui::RawInput {
+                viewport_id: viewport.ids.this,
+                events: events.unwrap_or_default(),
+                viewports: std::iter::once((viewport.ids.this, egui::ViewportInfo::default()))
+                    .collect(),
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(400.0, 120.0))),
+                ..Default::default()
+            };
+            let mut ui_cb = viewport.viewport_ui_cb;
+            let mut out = ctx.run_ui(input, |ui| ui_cb(ui));
+            out.textures_delta.clear();
+        });
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        // A pass of the question, with a key pressed in it (or not); the answer it gave.
+        let pass = |key: Option<egui::Key>, answer: &std::cell::Cell<Option<Outcome<bool>>>| {
+            KEY.with(|k| k.set(key));
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                answer.set(Some(cancel_waiting(ui.ctx(), 2)));
+            });
+            out.textures_delta.clear();
+            answer.take()
+        };
+        let answer = std::cell::Cell::new(None);
+        assert!(matches!(pass(None, &answer), Some(Outcome::Open)));
+        assert!(matches!(
+            pass(Some(egui::Key::Enter), &answer),
+            Some(Outcome::Done(true))
+        ));
+        // Opened again: a new question.
+        assert!(matches!(pass(None, &answer), Some(Outcome::Open)));
+        assert!(matches!(
+            pass(Some(egui::Key::Escape), &answer),
+            Some(Outcome::Done(false))
+        ));
+    }
+
     /// Add URL opens and its address box takes the focus, frame after frame, without the app
     /// hanging (0.2.2 froze here: an editable drop-down asked egui's context inside its lock).
     #[test]
@@ -3179,7 +3384,7 @@ mod tests {
                 };
                 for _ in 0..6 {
                     let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-                        let _ = dlg.show(ui.ctx());
+                        let _ = dlg.show(ui.ctx(), |_| None);
                     });
                     out.textures_delta.clear();
                 }
@@ -3188,6 +3393,55 @@ mod tests {
         });
         rx.recv_timeout(std::time::Duration::from_secs(20))
             .expect("Add URL hung");
+    }
+
+    /// #511: an address with an Options → Sites Logins entry shows that login in "Use
+    /// authorization" (the match the download uses), follows the address while left as filled,
+    /// and keeps a login typed in the box. OK hands on only a login of the user's own.
+    #[test]
+    fn add_url_shows_the_sites_logins_entry_for_its_address() {
+        // A made-up login; asserts don't print it.
+        const PASS: &str = "dummy-pass";
+        let settings = crate::settings::Settings {
+            site_logins: vec![(
+                "files.example.com/private".into(),
+                "demo".into(),
+                PASS.into(),
+            )],
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut dlg = AddUrl {
+            address: "https://files.example.com/private/x.zip".into(),
+            ..AddUrl::default()
+        };
+        let pass = |dlg: &mut AddUrl| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let _ = dlg.show(ui.ctx(), |u| settings.site_login(u));
+            });
+            out.textures_delta.clear();
+        };
+        pass(&mut dlg);
+        assert!(dlg.auth, "Use authorization is ticked");
+        assert_eq!(dlg.login, "demo");
+        assert!(dlg.password == PASS, "the password is the saved one");
+        assert!(dlg.typed_login().is_none(), "the download follows Options");
+
+        // Another address: the box filled from Options empties again.
+        dlg.address = "https://files.example.com/public/x.zip".into();
+        pass(&mut dlg);
+        assert!(!dlg.auth);
+        assert!(dlg.login.is_empty() && dlg.password.is_empty());
+
+        // Back to the address, then a login typed over it: kept, and handed on.
+        dlg.address = "https://files.example.com/private/y.zip".into();
+        pass(&mut dlg);
+        assert!(dlg.auth && dlg.login == "demo");
+        dlg.login = "someone".into();
+        dlg.address = "https://files.example.com/public/y.zip".into();
+        pass(&mut dlg);
+        assert!(dlg.auth && dlg.login == "someone", "a typed login stays");
+        assert_eq!(dlg.typed_login().map(|l| l.0).as_deref(), Some("someone"));
     }
 
     /// #207: a dialog closed by the window manager (its title bar's ×) is painted in the pass

@@ -656,6 +656,8 @@ fn supervise(
             Attempt::Stopped => return,
             Attempt::Done(f, problems, quality) => {
                 end(child);
+                // Named for what it holds (#569): HLS pieces joined without ffmpeg.
+                let f = named_for_content(f);
                 if relaxed_to.is_some()
                     && let Some(q) = quality
                 {
@@ -756,6 +758,10 @@ pub const MAX_WHILE_RUNNING: f64 = 0.999;
 /// is the next stream, never counted as one of `MDMQ`'s, and the window's size holds the total.
 /// Subtitle files come before the video with lines of their own, `NA` (#68): what they brought
 /// leaves the bar when the first stream's line comes.
+///
+/// Pieces fetched several at once ([`pace_args`]) report from each at its turn: the count can
+/// step back a little, which isn't a new stream (#531: one taken for it added a 25 MB estimate,
+/// and a 6 MB video read 66 MB). Then only a fall to under half of it, by 64 KB or more, is.
 struct Meter {
     expected: Option<u64>,
     /// `MDMQ`'s format id and resolution (`137+140 1920x1080`), once yt-dlp has said.
@@ -767,6 +773,8 @@ struct Meter {
     all_at_once: bool,
     /// Every line so far said `NA` for its format id (subtitle files).
     only_na: bool,
+    /// Pieces at once: the count may step back.
+    at_once: bool,
     /// The streams already finished, and the current one's last total and bytes.
     finished: u64,
     last_total: u64,
@@ -776,7 +784,7 @@ struct Meter {
 }
 
 impl Meter {
-    fn new(expected: Option<u64>) -> Self {
+    fn new(expected: Option<u64>, at_once: bool) -> Self {
         Meter {
             expected: expected.filter(|e| *e > 0),
             quality: None,
@@ -784,6 +792,7 @@ impl Meter {
             started: 0,
             all_at_once: false,
             only_na: true,
+            at_once,
             finished: 0,
             last_total: 0,
             last_got: 0,
@@ -875,7 +884,14 @@ impl Meter {
             }
             // As before: back near 0 is the next stream.
             None => {
-                if got < self.last_got && self.last_got > 0 {
+                // Pieces at once (#531): the count may step back a little within a stream;
+                // only a fall to under half of it, by 64 KB or more, is the next stream.
+                let back = if self.at_once {
+                    got.saturating_mul(2) < self.last_got && self.last_got - got >= 64 * 1024
+                } else {
+                    got < self.last_got
+                };
+                if back && self.last_got > 0 {
                     self.next_stream();
                 }
                 self.only_na &= id == Some("NA");
@@ -1051,6 +1067,67 @@ fn saved_by_name(ours: &[String]) -> Option<PathBuf> {
         .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
 }
 
+/// What a saved file holds when its name says otherwise: an HLS stream's pieces joined as they
+/// came, which only ffmpeg makes into the MP4 they're named for (#569). YouTube's HLS sound is
+/// raw AAC (ADTS frames, each piece led by an ID3 tag with its time): `aac`, which players open.
+/// A video's pieces are an MPEG transport stream: `ts`. A real MP4 (ffmpeg was there, or the
+/// format came as a file) is none of these.
+fn content_ext(head: &[u8]) -> Option<&'static str> {
+    // ID3v2 tags first: a 10-byte header, then the tag's size in 7-bit bytes.
+    let mut at = 0usize;
+    while head.len() >= at + 10 && &head[at..at + 3] == b"ID3" {
+        let size = head[at + 6..at + 10]
+            .iter()
+            .fold(0usize, |n, b| (n << 7) | usize::from(b & 0x7f));
+        let footer = if head[at + 5] & 0x10 != 0 { 10 } else { 0 };
+        at += 10 + size + footer;
+    }
+    let rest = head.get(at..)?;
+    // ADTS: a 12-bit sync word, then MPEG layer 0.
+    if rest.len() >= 7 && rest[0] == 0xff && rest[1] & 0xf6 == 0xf0 {
+        return Some("aac");
+    }
+    // A transport stream: a sync byte every 188 bytes.
+    if at == 0 && head.len() > 376 && [0, 188, 376].iter().all(|&i| head[i] == 0x47) {
+        return Some("ts");
+    }
+    None
+}
+
+/// `f`, renamed for what it holds when its MP4 name is wrong ([`content_ext`]); as it was
+/// otherwise, or when the rename fails (the file is kept).
+fn named_for_content(f: PathBuf) -> PathBuf {
+    let named = f
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    if !matches!(named.as_deref(), Some("mp4" | "m4a")) {
+        return f;
+    }
+    let mut head = Vec::with_capacity(8192);
+    let read = std::fs::File::open(&f).and_then(|file| {
+        use std::io::Read;
+        file.take(8192).read_to_end(&mut head)
+    });
+    let Some(ext) = read.ok().and_then(|_| content_ext(&head)) else {
+        return f;
+    };
+    let stem = f
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let free = (1..100)
+        .map(|n| match n {
+            1 => f.with_file_name(format!("{stem}.{ext}")),
+            n => f.with_file_name(format!("{stem} ({n}).{ext}")),
+        })
+        .find(|p| !p.exists());
+    match free {
+        Some(to) if std::fs::rename(&f, &to).is_ok() => to,
+        _ => f,
+    }
+}
+
 /// Wait `d`, or less if the download is stopped meanwhile (false then).
 fn pause(d: std::time::Duration, progress: &Mutex<Progress>) -> bool {
     let end = std::time::Instant::now() + d;
@@ -1157,7 +1234,8 @@ fn attempt(
         return failed(format!("Cannot write the video information: {e}"), rerouted);
     }
     let _cleanup = Remove(file.clone());
-    let mut meter = Meter::new(expected);
+    let at_once = ours.iter().any(|a| a == "--concurrent-fragments");
+    let mut meter = Meter::new(expected, at_once);
     let ran = match run(exe, ours, &file, progress, child, Some(&mut meter)) {
         Ok(Some(r)) => r,
         Ok(None) => return Attempt::Stopped,
@@ -1278,6 +1356,19 @@ fn template_text(s: &str) -> String {
     s.replace('%', "%%")
 }
 
+/// yt-dlp's speed: at most `rate` bytes/s; a stream in pieces (HLS, DASH) `fragments` pieces at
+/// once, as a file comes down over several connections (Options → Connection, #531). yt-dlp uses
+/// that for such streams only (a plain file stays one connection), and its limit holds for each
+/// piece, not for them together: with a limit, one piece at a time, so the limit stays the
+/// download's, whatever the format turns out to be.
+pub fn pace_args(rate: Option<u64>, fragments: u32) -> Vec<String> {
+    match rate {
+        Some(r) => vec!["--limit-rate".into(), r.to_string()],
+        None if fragments > 1 => vec!["--concurrent-fragments".into(), fragments.to_string()],
+        None => Vec::new(),
+    }
+}
+
 /// Our progress line: `MDMP <downloaded> <total> <estimate> <speed> <format id>` (`NA` when
 /// unknown; the format id is the stream's, `NA` for a subtitle file).
 const PROGRESS: &str = "download:MDMP %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s %(progress.speed)s %(info.format_id)s";
@@ -1288,8 +1379,8 @@ const FINAL: &str = "after_move:MDMF %(filepath)s";
 const QUALITY: &str = "video:MDMQ %(format_id)s %(resolution)s";
 
 impl VideoJob {
-    /// Download `url` in format `selector` to `dir/<stem>.<ext>`, at most `rate` bytes/s;
-    /// `ffmpeg` (its exe) merges separate video and audio into an MP4. `expected`: the size the
+    /// Download `url` in format `selector` to `dir/<stem>.<ext>`, at most `rate` bytes/s, a
+    /// stream in pieces `fragments` pieces at once ([`pace_args`]); `ffmpeg` (its exe) merges separate video and audio into an MP4. `expected`: the size the
     /// choice was shown with (every stream), so the progress starts from the whole. `browser`:
     /// what the browser's request for the page carried (proc::FromBrowser). `subs`: the
     /// subtitles to save with it (#68; none for a sound alone, which has no picture to put them
@@ -1302,13 +1393,14 @@ impl VideoJob {
         dir: &Path,
         stem: &str,
         rate: Option<u64>,
+        fragments: u32,
         ffmpeg: Option<&Path>,
         expected: Option<u64>,
         browser: &proc::FromBrowser,
         subs: &Subs,
     ) -> Result<VideoJob, ProcError> {
         Self::start_with(
-            exe, url, selector, dir, stem, rate, ffmpeg, expected, browser, subs, None,
+            exe, url, selector, dir, stem, rate, fragments, ffmpeg, expected, browser, subs, None,
         )
     }
 
@@ -1322,6 +1414,7 @@ impl VideoJob {
         dir: &Path,
         stem: &str,
         rate: Option<u64>,
+        fragments: u32,
         ffmpeg: Option<&Path>,
         expected: Option<u64>,
         browser: &proc::FromBrowser,
@@ -1333,7 +1426,15 @@ impl VideoJob {
         let output = dir.join(format!("{}.%(ext)s", template_text(stem)));
         // An MP3, Opus or FLAC choice (#32, #70): the best sound, converted by ffmpeg.
         let convert = crate::resolve::audio_conversion(selector);
-        let format = if convert.is_some() { "ba/b" } else { selector };
+        let format = if convert.is_some() {
+            "ba/b".to_owned()
+        } else if ffmpeg.is_none() {
+            // A format that comes as a file first (#569): without ffmpeg an HLS stream stays
+            // its raw pieces.
+            crate::resolve::without_remuxing(selector)
+        } else {
+            selector.to_owned()
+        };
         // What comes down is the sound as the site has it, not the file the choice's size
         // estimated: the progress follows yt-dlp's own total.
         let expected = if convert.is_some() { None } else { expected };
@@ -1341,7 +1442,7 @@ impl VideoJob {
         let with_subs = convert.is_none() && !subs.langs.is_empty();
         let mut ours: Vec<String> = vec![
             "-f".into(),
-            format.into(),
+            format,
             "-o".into(),
             output.to_string_lossy().into_owned(),
             "--no-playlist".into(),
@@ -1357,9 +1458,7 @@ impl VideoJob {
             "--print".into(),
             QUALITY.into(),
         ];
-        if let Some(r) = rate {
-            ours.extend(["--limit-rate".into(), r.to_string()]);
-        }
+        ours.extend(pace_args(rate, fragments));
         // A subtitles-only second run, for the ones a site refuses (#68): the same output name.
         let mut retry_base: Vec<String> = vec![
             "-o".into(),
@@ -1548,6 +1647,57 @@ mod tests {
         assert_eq!(names(true), want);
         assert!(own_files(&d.join("missing"), "Clip", true).is_empty());
     }
+    /// #569: what a file joined from HLS pieces holds, from its first bytes. YouTube's sound:
+    /// pieces each led by an ID3 tag (Apple's timestamp), then ADTS frames.
+    #[test]
+    fn joined_hls_pieces_are_named_for_what_they_hold() {
+        let mut aac = b"ID3     ?".to_vec();
+        aac.extend(std::iter::repeat_n(0u8, 0x3f));
+        aac.extend([0xff, 0xf1, 0x50, 0x80, 0x2e, 0x7f, 0xfc]);
+        assert_eq!(content_ext(&aac), Some("aac"));
+        // ADTS with no tag, and MPEG-1 layer 3 (an MP3: not ours to rename).
+        assert_eq!(content_ext(&[0xff, 0xf9, 0x50, 0x80, 0, 0, 0]), Some("aac"));
+        assert_eq!(content_ext(&[0xff, 0xfb, 0x90, 0x64, 0, 0, 0]), None);
+        let mut ts = vec![0u8; 400];
+        for i in [0, 188, 376] {
+            ts[i] = 0x47;
+        }
+        assert_eq!(content_ext(&ts), Some("ts"));
+        // A real MP4 (ffmpeg was there): as it is.
+        let mut mp4 = vec![0, 0, 0, 0x20];
+        mp4.extend(b"ftypisom");
+        mp4.resize(400, 0);
+        assert_eq!(content_ext(&mp4), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let joined = dir.path().join("Talk.mp4");
+        std::fs::write(&joined, &aac).unwrap();
+        assert_eq!(named_for_content(joined), dir.path().join("Talk.aac"));
+        assert!(dir.path().join("Talk.aac").is_file());
+        // Another Talk.aac there already: not overwritten.
+        std::fs::write(dir.path().join("Talk.mp4"), &aac).unwrap();
+        let second = named_for_content(dir.path().join("Talk.mp4"));
+        assert_eq!(second, dir.path().join("Talk (2).aac"));
+        // A real MP4 keeps its name; so does a sound already named .aac.
+        let real = dir.path().join("Real.mp4");
+        std::fs::write(&real, &mp4).unwrap();
+        assert_eq!(named_for_content(real.clone()), real);
+        let named = dir.path().join("Talk.aac");
+        assert_eq!(named_for_content(named.clone()), named);
+    }
+
+    /// #531: a stream in pieces comes down several at once, as many as a file's connections;
+    /// with a speed limit one at a time, as yt-dlp's limit holds for each piece (measured
+    /// against the lab server: `--limit-rate 512K -N 4` took a quarter of the time).
+    #[test]
+    fn fragments_at_once_unless_the_speed_is_limited() {
+        let s = |v: Vec<String>| v.join(" ");
+        assert_eq!(s(pace_args(None, 8)), "--concurrent-fragments 8");
+        assert_eq!(s(pace_args(None, 1)), "");
+        assert_eq!(s(pace_args(None, 0)), "");
+        assert_eq!(s(pace_args(Some(524_288), 8)), "--limit-rate 524288");
+    }
+
     /// Live (network, yt-dlp): `MDM_LIVE_YTDLP=<yt-dlp.exe> MDM_LIVE_PAGE=<video page>
     /// cargo test -p mdm-tools live_download -- --ignored --nocapture`. Downloads the smallest
     /// audio and prints the log (a swapped server shows there).
@@ -1566,6 +1716,7 @@ mod tests {
             dir.path(),
             "a",
             None,
+            1,
             ffmpeg.as_deref(),
             None,
             &Default::default(),
@@ -1608,6 +1759,7 @@ mod tests {
             dir.path(),
             "clip",
             None,
+            1,
             None,
             None,
             &Default::default(),
@@ -1637,6 +1789,7 @@ mod tests {
             dir.path(),
             "clip",
             None,
+            1,
             None,
             None,
             &Default::default(),
@@ -1657,7 +1810,11 @@ mod tests {
     }
 
     fn run(expected: Option<u64>, lines: &[&str]) -> Vec<(u64, Option<u64>)> {
-        let mut m = Meter::new(expected);
+        run_with(expected, false, lines)
+    }
+
+    fn run_with(expected: Option<u64>, at_once: bool, lines: &[&str]) -> Vec<(u64, Option<u64>)> {
+        let mut m = Meter::new(expected, at_once);
         let mut p = Progress {
             state: State::Running,
             downloaded: 0,
@@ -1712,6 +1869,42 @@ mod tests {
         let last = run(Some(1800), &lines).pop().unwrap();
         assert_eq!(last, (1800, Some(1800)));
         assert!(f[f.len() - 1] > 0.99, "{f:?}");
+    }
+
+    /// #531: yt-dlp's lines with 8 pieces at once (real ones, from the lab server's HLS stream of
+    /// 6 MB), its count stepping back now and then: never more than the file, and the end is
+    /// the file. A second stream (the sound after the picture) still adds up.
+    #[test]
+    fn pieces_at_once_step_back_without_a_new_stream() {
+        let lines = [
+            "30720 NA 6905856.0 5636",
+            "26624 NA 6905856.0 5636",
+            "1304576 NA 37576704.0 911582",
+            "1961984 NA 25104384.0 911582",
+            "1830912 NA 25104384.0 911582",
+            "4061184 NA 8382464.0 1683967",
+            "3929088 NA 8382464.0 1683967",
+            "6289408 NA 7704576.0 1883540",
+            "6158336 NA 7704576.0 1883540",
+            "6291456 NA 6553600.0 1883540",
+        ];
+        let v = run_with(None, true, &lines);
+        for (d, _) in &v {
+            assert!(*d <= 6_291_456, "more than the file: {v:?}");
+        }
+        assert_eq!(v.last().unwrap().0, 6_291_456);
+        // Before, the first step back counted the 6.9 MB estimate as a finished stream.
+        assert!(run(None, &lines).iter().any(|(d, _)| *d > 6_291_456));
+        let two = run_with(
+            None,
+            true,
+            &[
+                "4000000 4000000 NA 5",
+                "1024 NA 900000 5",
+                "900000 900000 NA 5",
+            ],
+        );
+        assert_eq!(two.last().unwrap().0, 4_900_000, "{two:?}");
     }
 
     /// The file size stays the file's size at the end: holding the bar short of 100 % is the
@@ -1771,8 +1964,21 @@ mod tests {
         }
     }
 
-    fn assert_ends(f: &[f64]) {
+    /// The bar at its end (`v`, the meter's lines). Drawn, it is held short of the end
+    /// ([`fractions`]); the meter's own figures reach the whole at the last line only, and never
+    /// go past it: 100 % is never said before the end.
+    fn assert_ends(v: &[(u64, Option<u64>)]) {
+        let f = fractions(v);
         assert!(f[f.len() - 1] >= MAX_WHILE_RUNNING - 1e-9, "{f:?}");
+        let raw: Vec<f64> = v
+            .iter()
+            .map(|(d, t)| *d as f64 / t.unwrap() as f64)
+            .collect();
+        assert!(raw.iter().all(|x| *x <= 1.0), "past 100 %: {raw:?}");
+        assert!(
+            raw[..raw.len() - 1].iter().all(|x| *x < 1.0),
+            "100 % before the end: {raw:?}"
+        );
     }
 
     /// An HLS stream's lines, as yt-dlp prints them for format `id` (none: lines without one,
@@ -1815,12 +2021,9 @@ mod tests {
     #[test]
     fn an_estimate_above_the_size_still_ends_at_the_end() {
         let stream = [hls_stream("hls-6400", 10, 100)];
-        let f = fractions(&run(
-            Some(2000),
-            &lines(Some("MDMQ hls-6400 1280x720"), &stream),
-        ));
-        assert_forward(&f);
-        assert_ends(&f);
+        let v = run(Some(2000), &lines(Some("MDMQ hls-6400 1280x720"), &stream));
+        assert_forward(&fractions(&v));
+        assert_ends(&v);
         let f = fractions(&as_before(Some(2000), &stream));
         assert!((f[f.len() - 1] - 0.5).abs() < 1e-9, "{f:?}");
     }
@@ -1841,7 +2044,7 @@ mod tests {
         assert_forward(&f);
         let video_end = streams[0].len() - 1;
         assert!(f[video_end] < 0.75, "the video's end looked whole: {f:?}");
-        assert_ends(&f);
+        assert_ends(&v);
         assert_eq!(v[v.len() - 1].0, 2000);
     }
 
@@ -1852,11 +2055,11 @@ mod tests {
     fn a_line_for_every_stream_at_once_is_the_whole_download() {
         let q = "MDMQ 7040+aud-English 1280x720";
         let all = [hls_stream("7040+aud-English", 20, 100)];
-        let f = fractions(&run(Some(4000), &lines(Some(q), &all)));
-        assert_forward(&f);
-        assert_ends(&f);
+        let v = run(Some(4000), &lines(Some(q), &all));
+        assert_forward(&fractions(&v));
+        assert_ends(&v);
         let v = run(Some(4000), &[q, "2000 2000 NA 2129866.9 7040+aud-English"]);
-        assert_ends(&fractions(&v));
+        assert_ends(&v);
     }
 
     /// Lines whose format id `MDMQ` didn't name, or `NA` on every line (a yt-dlp that names no
@@ -1875,7 +2078,7 @@ mod tests {
             assert_eq!(v, as_before(expected, &streams), "{expected:?} {ids:?}");
             assert_eq!(v[v.len() - 1].0, 2000);
             if expected != Some(4000) {
-                assert_ends(&fractions(&v[v.len() - 1..]));
+                assert_ends(&v[v.len() - 1..]);
             }
         }
     }
@@ -1902,7 +2105,7 @@ mod tests {
         assert_forward(&f);
         let video_end = streams[2].len() - 1;
         assert!(f[video_end] < 0.75, "the video's end looked whole: {f:?}");
-        assert_ends(&f);
+        assert_ends(&v[subs..]);
         assert_eq!(v[v.len() - 1].0, 2000);
     }
 
@@ -1923,7 +2126,7 @@ mod tests {
         assert_forward(&f);
         let video_end = streams[0].len() - 1;
         assert!(f[video_end] < 0.75, "the video's end looked whole: {f:?}");
-        assert_ends(&f);
+        assert_ends(&v);
         assert_eq!(v[video_end].0, 1600);
         assert_eq!(v[v.len() - 1].0, 2000);
     }
@@ -1951,9 +2154,9 @@ mod tests {
         }
         l.push("1000 1000 NA 5 hls-1".to_owned());
         let l: Vec<&str> = l.iter().map(String::as_str).collect();
-        let f = fractions(&run(Some(2000), &l));
-        assert_forward(&f);
-        assert_ends(&f);
+        let v = run(Some(2000), &l);
+        assert_forward(&fractions(&v));
+        assert_ends(&v);
     }
 
     /// The video window's size below what comes: the same figures as before yt-dlp named its
@@ -1984,7 +2187,7 @@ mod tests {
     /// nothing is named before yt-dlp has said, nor `NA`.
     #[test]
     fn the_streams_are_named_by_their_format_ids() {
-        let mut m = Meter::new(None);
+        let mut m = Meter::new(None, false);
         assert_eq!(m.named(Some("137")), None);
         let cases: [(&str, &[&str], &[&str]); 4] = [
             (

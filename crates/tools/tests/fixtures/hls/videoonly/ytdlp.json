@@ -8,7 +8,8 @@
    "format_id": "a1-main",
    "ext": "mp4",
    "vcodec": "none",
-   "tbr": null
+   "tbr": null,
+   "protocol": "m3u8_native"
   },
   {
    "format_id": "96",
@@ -16,7 +17,8 @@
    "fps": null,
    "vcodec": "none",
    "acodec": "mp4a.40.2",
-   "tbr": 96.0
+   "tbr": 96.0,
+   "protocol": "m3u8_native"
   },
   {
    "format_id": "1200",
@@ -25,7 +27,8 @@
    "fps": null,
    "vcodec": "avc1.4d401e",
    "acodec": "none",
-   "tbr": 1200.0
+   "tbr": 1200.0,
+   "protocol": "m3u8_native"
   },
   {
    "format_id": "3000",
@@ -34,7 +37,8 @@
    "fps": null,
    "vcodec": "avc1.4d401f",
    "acodec": "none",
-   "tbr": 3000.0
+   "tbr": 3000.0,
+   "protocol": "m3u8_native"
   }
  ]
 }

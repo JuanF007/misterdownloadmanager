@@ -18,13 +18,15 @@
    "format_id": "aac-Deutsch",
    "ext": "mp4",
    "vcodec": "none",
-   "tbr": null
+   "tbr": null,
+   "protocol": "m3u8_native"
   },
   {
    "format_id": "aac-English",
    "ext": "mp4",
    "vcodec": "none",
-   "tbr": null
+   "tbr": null,
+   "protocol": "m3u8_native"
   },
   {
    "format_id": "800",
@@ -33,7 +35,8 @@
    "fps": null,
    "vcodec": "avc1.42e01e",
    "acodec": "none",
-   "tbr": 800.0
+   "tbr": 800.0,
+   "protocol": "m3u8_native"
   },
   {
    "format_id": "2800",
@@ -42,7 +45,8 @@
    "fps": 30.0,
    "vcodec": "avc1.4d401f",
    "acodec": "none",
-   "tbr": 2800.0
+   "tbr": 2800.0,
+   "protocol": "m3u8_native"
   },
   {
    "format_id": "4500",
@@ -51,7 +55,8 @@
    "fps": 60.0,
    "vcodec": "avc1.640028",
    "acodec": "none",
-   "tbr": 4500.0
+   "tbr": 4500.0,
+   "protocol": "m3u8_native"
   }
  ]
 }
