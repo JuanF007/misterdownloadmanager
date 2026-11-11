@@ -690,7 +690,7 @@ async fn probe_is_a_plain_get() {
     assert_eq!(log.iter().filter(|e| e.range.is_none()).count(), 1);
     assert!(
         log.iter()
-            .all(|e| e.user_agent.as_deref() == Some(mdm_engine::download::DEFAULT_USER_AGENT))
+            .all(|e| e.user_agent.as_deref() == Some(mdm_engine::agent::automatic().as_str()))
     );
 }
 
@@ -1736,11 +1736,15 @@ async fn a_slow_flush_does_not_stop_the_transfer() {
         .await
         .expect("every request ends");
     let log = s.log().split_off(before);
-    // At most one 1.5 s flush more than the yardstick, with room for a busy machine. Before the
-    // fix every tick's flush stalled all writes for 1.5 s: 7.6 s measured against about 1 s, and
-    // more ticks the slower the machine, so the gap only grows.
+    // At most one 1.5 s flush more than the yardstick, with room for a busy machine: 4.5 s, or
+    // most of the yardstick again when it is long (a busy runner slows this run as much as the
+    // yardstick's; 10.3 s against 5.8 s failed the fixed 4.5 s once). Before the fix every
+    // tick's flush stalled all writes for 1.5 s, one per 0.1 s tick: 7.6 s measured against
+    // about 1 s, and many times the yardstick on a slower machine, far past either bound.
+    let allowed = (yardstick + std::time::Duration::from_millis(4500))
+        .max(yardstick.mul_f64(1.8) + std::time::Duration::from_millis(1500));
     assert!(
-        took < yardstick + std::time::Duration::from_millis(4500),
+        took < allowed,
         "took {took:?}, the same download without the slow flush {yardstick:?}"
     );
     // No connection reconnected because of the disk's stall: the probe, seven more, and the
@@ -1764,6 +1768,7 @@ async fn a_refused_browser_agent_is_asked_again_as_mdm() {
         },
         Options {
             user_agent: browser.to_owned(),
+            automatic_agent: false,
             ..fast_opts()
         },
     )
@@ -1782,6 +1787,7 @@ async fn a_refused_browser_agent_is_asked_again_as_mdm() {
         },
         Options {
             user_agent: browser.to_owned(),
+            automatic_agent: false,
             agent_fallback: Some("MDM-test".to_owned()),
             ..fast_opts()
         },

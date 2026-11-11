@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "Âm thanh"
   },
+  "video_open_post": {
+    "message": "Mở bài đăng, sau đó dùng nút ở đó"
+  },
   "popup_send_to": {
     "message": "Gửi tải xuống đến"
   },

@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "Audio"
   },
+  "video_open_post": {
+    "message": "Deschideți postarea, apoi utilizați butonul de acolo"
+  },
   "popup_send_to": {
     "message": "Trimite descărcările la"
   },

@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "ఆడియో"
   },
+  "video_open_post": {
+    "message": "పోస్ట్‌ను తెరవండి, ఆపై అక్కడ బటన్‌ను ఉపయోగించండి"
+  },
   "popup_send_to": {
     "message": "డౌన్‌లోడ్‌లను దీనికి పంపండి"
   },

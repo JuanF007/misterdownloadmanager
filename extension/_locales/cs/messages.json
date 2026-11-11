@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "Zvuk"
   },
+  "video_open_post": {
+    "message": "Otevřete příspěvek a použijte tlačítko tam"
+  },
   "popup_send_to": {
     "message": "Odeslat stahování do"
   },

@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "Audio"
   },
+  "video_open_post": {
+    "message": "Atveriet ierakstu, tad izmantojiet pogu tur"
+  },
   "popup_send_to": {
     "message": "Sūtīt lejupielādes uz"
   },

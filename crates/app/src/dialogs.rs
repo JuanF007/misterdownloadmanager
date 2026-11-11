@@ -125,6 +125,7 @@ pub fn keep_theme(
     let theme_key = key.with("theme");
     let shown_key = key.with("shown");
     let front_key = key.with("front");
+    let caption_key = key.with("caption");
     // Not drawn in the last pass, the window is gone and this is a new one, hidden until it is
     // told otherwise, whatever the last one was told (#440).
     if !open || window_was_gone(ctx, key.with("theme-pass")) {
@@ -132,6 +133,7 @@ pub fn keep_theme(
             d.remove::<bool>(theme_key);
             d.remove::<bool>(shown_key);
             d.remove::<u32>(front_key);
+            d.remove::<bool>(caption_key);
         });
     }
     if !open {
@@ -182,11 +184,17 @@ pub fn keep_theme(
     }
     #[cfg(not(windows))]
     let _ = front_key;
-    // Belt and braces: a no-op when the caption is already right.
+    // Belt and braces, once per window and theme (until the window is found): asked every frame,
+    // the window's thread waited on DWM, or on a busy window of this process while looking for
+    // its own, in a stalled system (#633, #583).
     #[cfg(windows)]
-    crate::win32::caption_dark(title, dark);
+    if ctx.data(|d| d.get_temp::<bool>(caption_key)) != Some(dark)
+        && crate::win32::caption_dark(title, dark)
+    {
+        ctx.data_mut(|d| d.insert_temp(caption_key, dark));
+    }
     #[cfg(not(windows))]
-    let _ = title;
+    let _ = (title, caption_key);
 }
 
 /// Whether the window `key` is drawn again after a pass that didn't draw it: egui destroys a
@@ -603,6 +611,8 @@ pub struct AddUrl {
     /// (#511): "Use authorization" shows it while the box is left as it was filled.
     looked_up: String,
     filled: Option<(String, String)>,
+    /// The clipboard's link, read off the window's thread (#661).
+    clip: crate::clipboard::Prefill,
 }
 
 pub struct NewUrl {
@@ -612,18 +622,27 @@ pub struct NewUrl {
 
 impl AddUrl {
     /// Opens like IDM's: pre-filled with the clipboard's text when it is an http(s) URL (or a
-    /// magnet link: OK then opens Add torrent).
+    /// magnet link: OK then opens Add torrent). The clipboard is read off the window's thread,
+    /// and the address put in the box on the frame it comes ([`AddUrl::fill_from_clipboard`]).
     pub fn from_clipboard(history: &[String]) -> Self {
-        let clip = crate::clipboard_text().unwrap_or_default();
-        let clip = clip.trim();
-        let address = match Url::parse(clip) {
-            Ok(u) if mdm_engine::supported(&u) || u.scheme() == "magnet" => clip.to_owned(),
-            _ => String::new(),
-        };
         AddUrl {
-            address,
             history: history.to_vec(),
+            clip: crate::clipboard::Prefill::ask(),
             ..AddUrl::default()
+        }
+    }
+
+    /// The clipboard's text in the box, when it is an address MDM downloads and the box is
+    /// still empty (nothing typed or picked meanwhile).
+    fn fill_from_clipboard(&mut self, clip: &str) {
+        let clip = clip.trim();
+        if !self.address.is_empty() {
+            return;
+        }
+        if let Ok(u) = Url::parse(clip)
+            && (mdm_engine::supported(&u) || u.scheme() == "magnet")
+        {
+            self.address = clip.to_owned();
         }
     }
 
@@ -664,6 +683,9 @@ impl AddUrl {
         ctx: &egui::Context,
         site_login: impl Fn(&Url) -> Option<(String, String)>,
     ) -> Outcome<NewUrl> {
+        if let Some(clip) = self.clip.take() {
+            self.fill_from_clipboard(&clip);
+        }
         self.follow_site_login(site_login);
         window(
             ctx,
@@ -3393,6 +3415,94 @@ mod tests {
         });
         rx.recv_timeout(std::time::Duration::from_secs(20))
             .expect("Add URL hung");
+    }
+
+    /// #661: Add URL asks for the clipboard as it opens and draws its frames without waiting for
+    /// the answer, even from a clipboard owner that never answers; the link fills the box on the
+    /// frame it comes, the caret after it as when it opens with it, and never a box typed in.
+    #[test]
+    fn add_url_never_waits_for_the_clipboard() {
+        use std::time::{Duration, Instant};
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let stuck = std::sync::Mutex::new(stuck);
+        let reader: &'static crate::clipboard::Reader =
+            Box::leak(Box::new(crate::clipboard::Reader::new(
+                move || {
+                    let _ = stuck.lock().unwrap().recv();
+                    Some(
+                        " https://late.example/a.zip
+"
+                        .to_owned(),
+                    )
+                },
+                || {},
+            )));
+        let ctx = egui::Context::default();
+        let frame = |dlg: &mut AddUrl, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                let _ = dlg.show(ui.ctx(), |_| None);
+            });
+            out.textures_delta.clear();
+        };
+        let mut dlg = AddUrl {
+            clip: crate::clipboard::Prefill::ask_of(reader),
+            ..AddUrl::default()
+        };
+        let mut typed = AddUrl {
+            clip: crate::clipboard::Prefill::ask_of(reader),
+            ..AddUrl::default()
+        };
+        let started = Instant::now();
+        for _ in 0..10 {
+            frame(&mut dlg, vec![]);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "10 frames took {:?}",
+            started.elapsed()
+        );
+        assert!(dlg.address.is_empty(), "nothing yet");
+        typed.address = "https://typed.example/b.zip".into();
+        drop(release);
+        let until = Instant::now() + Duration::from_secs(5);
+        while dlg.address.is_empty() && Instant::now() < until {
+            frame(&mut dlg, vec![]);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(dlg.address, "https://late.example/a.zip");
+        // The caret is at its end, as in a box that opened with it: typing goes after it.
+        frame(&mut dlg, vec![]);
+        frame(&mut dlg, vec![egui::Event::Text("x".into())]);
+        assert_eq!(dlg.address, "https://late.example/a.zipx");
+        while typed.clip.pending() && Instant::now() < until {
+            frame(&mut typed, vec![]);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!typed.clip.pending(), "answered");
+        assert_eq!(typed.address, "https://typed.example/b.zip", "typed: kept");
+    }
+
+    #[test]
+    fn add_url_takes_only_an_address_it_downloads_from_the_clipboard() {
+        let fill = |clip: &str| {
+            let mut d = AddUrl::default();
+            d.fill_from_clipboard(clip);
+            d.address
+        };
+        assert_eq!(
+            fill(
+                " https://a.example/f.zip 
+"
+            ),
+            "https://a.example/f.zip"
+        );
+        assert_eq!(fill("magnet:?xt=urn:btih:ab"), "magnet:?xt=urn:btih:ab");
+        assert_eq!(fill("some words"), "");
+        assert_eq!(fill("mailto:a@b.example"), "");
     }
 
     /// #511: an address with an Options → Sites Logins entry shows that login in "Use

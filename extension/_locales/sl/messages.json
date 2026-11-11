@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "Zvok"
   },
+  "video_open_post": {
+    "message": "Odprite objavo, nato uporabite gumb tam"
+  },
   "popup_send_to": {
     "message": "Pošlji prenose v"
   },

@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "Audio"
   },
+  "video_open_post": {
+    "message": "Beitrag öffnen, dann die Schaltfläche dort verwenden"
+  },
   "popup_send_to": {
     "message": "Downloads senden an"
   },

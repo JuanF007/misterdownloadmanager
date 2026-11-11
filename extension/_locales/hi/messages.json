@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "ऑडियो"
   },
+  "video_open_post": {
+    "message": "पोस्ट खोलें, फिर वहां बटन का उपयोग करें"
+  },
   "popup_send_to": {
     "message": "डाउनलोड यहां भेजें"
   },

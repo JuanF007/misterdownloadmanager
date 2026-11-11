@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "Garsas"
   },
+  "video_open_post": {
+    "message": "Atidarykite įrašą, tada naudokite ten esantį mygtuką"
+  },
   "popup_send_to": {
     "message": "Siųsti atsisiuntimus į"
   },

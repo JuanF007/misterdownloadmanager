@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "Lyd"
   },
+  "video_open_post": {
+    "message": "Åpne innlegget, og bruk deretter knappen der"
+  },
   "popup_send_to": {
     "message": "Send nedlastinger til"
   },

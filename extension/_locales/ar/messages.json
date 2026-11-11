@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "صوت"
   },
+  "video_open_post": {
+    "message": "افتح المنشور، ثم استخدم الزر هناك"
+  },
   "popup_send_to": {
     "message": "إرسال التنزيلات إلى"
   },

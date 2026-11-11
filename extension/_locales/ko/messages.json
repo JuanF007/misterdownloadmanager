@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "오디오"
   },
+  "video_open_post": {
+    "message": "게시물을 열고 버튼을 사용하세요"
+  },
   "popup_send_to": {
     "message": "다운로드 보낼 위치"
   },

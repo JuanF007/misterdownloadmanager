@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "صدا"
   },
+  "video_open_post": {
+    "message": "پست را باز کنید، سپس از دکمه آنجا استفاده کنید"
+  },
   "popup_send_to": {
     "message": "ارسال دانلودها به"
   },

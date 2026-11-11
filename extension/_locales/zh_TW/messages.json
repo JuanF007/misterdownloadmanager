@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "音訊"
   },
+  "video_open_post": {
+    "message": "開啟貼文，然後使用該處的按鈕"
+  },
   "popup_send_to": {
     "message": "傳送下載項目至"
   },

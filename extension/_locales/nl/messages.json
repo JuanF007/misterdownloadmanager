@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "Audio"
   },
+  "video_open_post": {
+    "message": "Open het bericht en gebruik dan de knop daar"
+  },
   "popup_send_to": {
     "message": "Downloads verzenden naar"
   },

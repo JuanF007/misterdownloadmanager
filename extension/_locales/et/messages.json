@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "Heli"
   },
+  "video_open_post": {
+    "message": "Ava postitus, siis kasuta sealset nuppu"
+  },
   "popup_send_to": {
     "message": "Saada allalaadimised asukohta"
   },

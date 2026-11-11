@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "オーディオ"
   },
+  "video_open_post": {
+    "message": "投稿を開いて、そこにあるボタンを使用してください"
+  },
   "popup_send_to": {
     "message": "ダウンロードの送信先"
   },

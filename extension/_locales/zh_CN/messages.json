@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "音频"
   },
+  "video_open_post": {
+    "message": "打开帖子，然后使用那里的按钮"
+  },
   "popup_send_to": {
     "message": "将下载发送到"
   },

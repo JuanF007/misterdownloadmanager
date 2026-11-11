@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "Audio"
   },
+  "video_open_post": {
+    "message": "Buka postingan, lalu gunakan tombol di sana"
+  },
   "popup_send_to": {
     "message": "Kirim unduhan ke"
   },

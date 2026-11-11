@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "Аудио"
   },
+  "video_open_post": {
+    "message": "Отворите објаву, па користите дугме тамо"
+  },
   "popup_send_to": {
     "message": "Шаљи преузимања на"
   },

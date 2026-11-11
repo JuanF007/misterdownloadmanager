@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "Audio"
   },
+  "video_open_post": {
+    "message": "Buka siaran, kemudian gunakan butang di sana"
+  },
   "popup_send_to": {
     "message": "Hantar muat turun ke"
   },

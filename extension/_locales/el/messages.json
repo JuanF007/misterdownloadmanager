@@ -221,6 +221,9 @@
   "video_tab_audio": {
     "message": "Ήχος"
   },
+  "video_open_post": {
+    "message": "Ανοίξτε την ανάρτηση και μετά χρησιμοποιήστε το κουμπί εκεί"
+  },
   "popup_send_to": {
     "message": "Αποστολή λήψεων σε"
   },
