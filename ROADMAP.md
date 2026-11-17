@@ -1436,6 +1436,8 @@ These ship in the next version.
 - ✅ Windows: a dialog that opens while you are in another program (the duplicate download
   question the browser asks, Download File Info) no longer brings the main window up behind it;
   it has its own taskbar button
+- ✅ The same video picked from the quality menu in a second tab of its page is a duplicate, even
+  when its stream's address is signed for each load (it was downloaded again without a word)
 
 ## Being worked on
 
