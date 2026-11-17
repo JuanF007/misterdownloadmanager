@@ -481,6 +481,30 @@ pub fn come_forward(title: &str) -> Option<bool> {
     Some(lift)
 }
 
+/// Whether the window in front (the one the keyboard goes to) is the main window or one of the
+/// dialogs it owns: the user is working in the main window. Not another program's window, nor
+/// a window of ours that stands on its own (a progress window, a dialog opened over the browser).
+pub fn main_in_front() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetForegroundWindow, GetWindow};
+    let Some(main) = find_own_window(crate::MAIN_TITLE) else {
+        return false;
+    };
+    // SAFETY: plain queries; any handle, or none, is accepted.
+    let mut hwnd = unsafe { GetForegroundWindow() };
+    // A dialog's question is owned by the main window too: a short chain.
+    for _ in 0..4 {
+        if hwnd.is_null() {
+            return false;
+        }
+        if hwnd == main {
+            return true;
+        }
+        // SAFETY: as above.
+        hwnd = unsafe { GetWindow(hwnd, GW_OWNER) };
+    }
+    false
+}
+
 /// Whether our window titled `title` exists and is not on the screen: hidden and not minimized
 /// (a window whose owner is minimized counts: Windows hides it with its owner).
 pub fn window_hidden(title: &str) -> bool {
@@ -529,9 +553,10 @@ unsafe fn above_others(hwnd: HWND) {
 /// Give our window titled `title` IDM's modal-dialog frame (WS_EX_DLGMODALFRAME, no sizing
 /// frame: 3 px borders, 26 px caption) and resize it so the client stays `client` points, at
 /// `scale` pixels per point (the display's scaling times any zoom), with the frame measured for
-/// the window's own DPI. `light` dialogs get a light caption.
+/// the window's own DPI. `light` dialogs get a light caption. `owned`: the main window owns it
+/// (see there).
 /// Returns true once applied (call again each frame until it is).
-pub fn dialog_frame(title: &str, client: [f32; 2], light: bool, scale: f32) -> bool {
+pub fn dialog_frame(title: &str, client: [f32; 2], light: bool, scale: f32, owned: bool) -> bool {
     use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
     use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
     let Some(hwnd) = find_own_window(title) else {
@@ -546,8 +571,12 @@ pub fn dialog_frame(title: &str, client: [f32; 2], light: bool, scale: f32) -> b
             &dark as *const i32 as *const c_void,
             size_of::<i32>() as u32,
         );
-        // Owned by the main window, as IDM's dialogs are: no taskbar button, kept above it.
-        if let Some(main) = find_own_window(crate::MAIN_TITLE) {
+        // Owned by the main window, as IDM's dialogs are: no taskbar button, kept above it. Only
+        // when asked for (`owned`): Windows brings an owned window's owner forward with it each
+        // time it is activated (by MDM, or by a click on it), so a dialog over another program
+        // (the browser's duplicate question) brought the main window up from behind it. One on
+        // its own has its own taskbar button.
+        if owned && let Some(main) = find_own_window(crate::MAIN_TITLE) {
             use windows_sys::Win32::UI::WindowsAndMessaging::{GWLP_HWNDPARENT, WS_EX_APPWINDOW};
             SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, main as isize);
             let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & !WS_EX_APPWINDOW;

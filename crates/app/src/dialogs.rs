@@ -575,8 +575,13 @@ fn dialog_window<T>(
                         d.insert_temp(key.with("hwnd"), h);
                     });
                 }
-            } else if crate::win32::dialog_frame(title, shown, !crate::theme::dark_surface(), scale)
-            {
+            } else if crate::win32::dialog_frame(
+                title,
+                shown,
+                !crate::theme::dark_surface(),
+                scale,
+                owned_by_main(ctx, key, crate::win32::main_in_front),
+            ) {
                 ctx.data_mut(|d| d.insert_temp(framed, want));
             }
         }
@@ -629,7 +634,27 @@ fn forget_window(ctx: &egui::Context, vid: ViewportId, key: egui::Id) {
     ctx.data_mut(|d| {
         d.remove::<[f32; 2]>(key.with("framed"));
         d.remove::<isize>(key.with("hwnd"));
+        d.remove::<bool>(key.with("owned"));
     });
+}
+
+/// Whether this opening of a dialog is owned by the main window (Windows, `win32::dialog_frame`):
+/// when it opens while the user works in the main window (`main_in_front`: it, or a dialog it
+/// owns, in front), as IDM's dialogs are. One that opens over another program (Download File
+/// Info or the duplicate question the browser asked for, a notice) or over a window of ours that
+/// stands on its own (a progress window's question) stands on its own too: activating an owned
+/// window brings its owner forward with it, so the main window came up behind it. Asked once per
+/// opening, while the window is still hidden (before it takes the focus itself); a frame applied
+/// again (a new size, another monitor's scale) keeps the answer.
+#[cfg(windows)]
+fn owned_by_main(ctx: &egui::Context, key: egui::Id, main_in_front: impl FnOnce() -> bool) -> bool {
+    let owned = key.with("owned");
+    if let Some(known) = ctx.data(|d| d.get_temp::<bool>(owned)) {
+        return known;
+    }
+    let answer = main_in_front();
+    ctx.data_mut(|d| d.insert_temp(owned, answer));
+    answer
 }
 
 /// Whether the windows' title bars are ours: a style theme's on Windows (#45). Elsewhere the
@@ -4242,6 +4267,27 @@ fn ensure_folder_with<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dialog that opened over the browser stays on its own for as long as it is open, even
+    /// once it is the window in front (its frame applied again at a new size); the next opening
+    /// asks again.
+    #[cfg(windows)]
+    #[test]
+    fn a_dialog_is_owned_or_not_once_per_opening() {
+        let ctx = egui::Context::default();
+        let key = egui::Id::unique("owned-test");
+        assert!(
+            !owned_by_main(&ctx, key, || false),
+            "over the browser: on its own"
+        );
+        assert!(
+            !owned_by_main(&ctx, key, || true),
+            "in front now, still on its own"
+        );
+        forget_window(&ctx, ViewportId::from_hash_of("owned-test"), key);
+        assert!(owned_by_main(&ctx, key, || true), "opened from MDM: owned");
+        assert!(owned_by_main(&ctx, key, || panic!("asked again")));
+    }
 
     /// #440: Download File Info behind the Create folder question ended without a closing pass,
     /// and the next one opened as a new, hidden window that was never told to show: later
