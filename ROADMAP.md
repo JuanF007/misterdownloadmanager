@@ -573,6 +573,13 @@ These ship in the next version.
   record over it; a new speed limit no longer restarts a recording. Closing MDM while it records
   and the command line still don't save it
   ([#1450](https://github.com/anefzaoui/misterdownloadmanager/pull/1450))
+- ✅ A Docker image of the headless server is published with each release, at
+  `ghcr.io/anefzaoui/misterdownloadmanager` (x86-64 only for now, thanks to
+  [@kngkatak](https://github.com/kngkatak))
+- ✅ File names as browsers read them: a server's percent-encoded `filename="My%20Report.pdf"` is
+  `My Report.pdf`, as in Chrome and Firefox (it stayed encoded), and RFC 2047's encoded words are
+  read too; checked behind one and two redirects, relative ones included
+  ([#1427](https://github.com/anefzaoui/misterdownloadmanager/issues/1427))
 - ✅ Video qualities: **Most compatible (H.264 + AAC)**, the best H.264 picture with AAC sound in an
   MP4 that editors, older TVs and phones open as it is, in the Download video window, the menu over
   a video, a playlist's quality and `video-get -q compatible`; picked, never converted
@@ -586,6 +593,12 @@ These ship in the next version.
   ([#1403](https://github.com/anefzaoui/misterdownloadmanager/issues/1403))
 - ✅ Malay: 24 menu and column items reviewed by a native speaker (torrent columns, Linux display
   systems, text rendering and graphics notes) (thanks to [@9M2PJU](https://github.com/9M2PJU))
+- ✅ Fuzzing: the parts that read what servers, pages and downloaded files send (HLS playlists,
+  yt-dlp's answers, web pages, file names, .torrent files and magnet links, release signatures,
+  Click'n'Load posts, archives) are tried with generated inputs on every pull request that
+  changes them and every week (ClusterFuzzLite); robustness fixes in reading HLS and DASH
+  streams' pieces, a video's sizes and a .torrent file's trackers came out of it, and Link grabber
+  no longer lists an `ftps:` link that names no server
 
 - ✅ Torrents connect over uTP (BitTorrent over UDP) beside TCP, on by default with a switch in
   Torrent settings: peers that take only uTP are reached, so torrents find as many peers as in
@@ -1563,6 +1576,10 @@ These ship in the next version.
   first, community packages labelled); the benchmark's figures say they come from a test server
   on the same PC
 - ✅ CI's Linux libraries step retries a slow package mirror instead of timing out
+- ✅ Website: a [code signing policy](https://misterdownloadmanager.com/code-signing-policy.html)
+  page (which Windows files are signed, who reviews and approves, privacy), linked from every
+  page's footer, the download page and the README; the privacy policy says what the crash
+  report window asks GitHub
 
 ## Being worked on
 
