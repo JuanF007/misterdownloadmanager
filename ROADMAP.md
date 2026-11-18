@@ -572,6 +572,7 @@ These ship in the next version.
   anew after setting the earlier recording aside as `<name> (recording 1).ts`, where it used to
   record over it; a new speed limit no longer restarts a recording. Closing MDM while it records
   and the command line still don't save it
+  ([#1450](https://github.com/anefzaoui/misterdownloadmanager/pull/1450))
 - ✅ Video qualities: **Most compatible (H.264 + AAC)**, the best H.264 picture with AAC sound in an
   MP4 that editors, older TVs and phones open as it is, in the Download video window, the menu over
   a video, a playlist's quality and `video-get -q compatible`; picked, never converted
