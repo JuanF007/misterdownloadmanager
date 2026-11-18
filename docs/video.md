@@ -89,11 +89,23 @@ YouTube serves each connection's long requests slowly, so MDM asks for the video
 
 Some videos yt-dlp still downloads by itself, over its own connection, and the progress window says so:
 
-- a live stream still being recorded;
+- a live stream still being recorded ([Recording a live stream](#recording-a-live-stream));
 - a stream sent over RTMP, RTSP, MMS or FTP;
 - the rare streams in pieces of other kinds (Adobe's HDS, Microsoft's Smooth Streaming), and one whose key the site hands yt-dlp directly.
 
-For those, a new speed limit starts the download again with it, from where it was ([Speed limits](#speed-limits)).
+For those, a new speed limit starts the download again with it, from where it was ([Speed limits](#speed-limits)); a live stream that is recording takes it the next time it starts.
+
+### Recording a live stream {#recording-a-live-stream}
+
+A live stream, a broadcast still going on, is recorded by yt-dlp with ffmpeg into an unfinished file, so MDM can't know its length. While it records, the progress window says **Recording...**, and **Downloaded** and **Transfer rate** follow the size of what has been recorded so far.
+
+- **Stop and save** is what the progress window's pause button reads for a live stream that is recording. It, **Stop** and **Stop All** in the list (toolbar and menus), a queue's stop (by hand, at its scheduled stop time, or through the API) and the phone page's pause all end the recording and keep it. MDM makes the recording an MP4 itself, as yt-dlp does when a live stream ends: the streams are copied as they are, nothing is converted. The window says **Saving...** meanwhile, and the download is then **Complete**, as when a live stream ends by itself: the queue goes on and the completion notice and actions run.
+- **The last moments may be missing:** at most the last 1 MiB the recorder hadn't written yet. That is a few seconds of video, and up to about a minute for a stream with sound only.
+- **If the MP4 can't be made**, the recording is kept as an MPEG-TS file (`.ts`), which most players open. If that can't be done either, the download says so and the unfinished file stays as it is. MDM removes the unfinished file only once ffmpeg has made the MP4 without an error and the MP4 holds at least half of the recording.
+- **Cancel** in the progress window only stops the download: the recording stays in its unfinished file. So does reaching a [download limit](queues-and-scheduler.md#download-limits), which counts a recording as it grows and stops it as it stops other downloads. **Resume**, or MDM starting the download again by itself (after a network adapter change or the download limit, or a queue that starts when MDM opens), records the stream anew. It first sets the earlier recording aside, next to it, as `My stream (recording 1).ts` (then `(recording 2)`, and so on), so nothing is recorded over. If that file can't be set aside, MDM doesn't record over it and says so.
+- These kept recordings aren't the download's own files: **Delete** with its files leaves them.
+- Closing MDM while a live stream records, or while it saves one, stops it without saving: the recording stays in its unfinished file (a half-made MP4 is left as `<name>.temp.mp4`, which **Delete** with its files removes), and it is set aside when the download starts again. The command line (`misterdownloadmanager-cli`) doesn't save a live stream this way.
+- A live stream saved by a queue's stop counts as complete, so a daily queue doesn't start it again the next day.
 
 ## Subtitles
 
@@ -142,7 +154,7 @@ A page address that points at one video inside a playlist or a mix (for example 
 
 Videos keep to the [Speed Limiter](connections-and-speed.md#speed-limiter): the limit for one file, a video's own limit (the **Speed Limiter** tab of its progress window), and the limit for all downloads together, which they share with every other download. MDM's own downloader brings them in, so a change applies at once, as for a file.
 
-A video yt-dlp downloads by itself ([How a video comes down](#how-a-video-comes-down)) takes a limit only as it starts: when you turn the limiter on or off, change its settings or the video's own limit, MDM stops it and starts it again with the new limit, and it goes on from where it was (the log says "Stopped: the speed limit changed; starting again with it"). Under the limit for all downloads, such videos share it evenly: when another starts, the ones running with more than their share start again with it; when one ends, the others keep theirs. A gallery's pictures that MDM brings in follow a change at once; what gallery-dl still fetches itself starts again with the new limit, skipping the files already saved. Other changes (torrents taking more or less of the limit for all downloads, **Only while I'm using the computer**) apply to the next one that starts.
+A video yt-dlp downloads by itself ([How a video comes down](#how-a-video-comes-down)) takes a limit only as it starts: when you turn the limiter on or off, change its settings or the video's own limit, MDM stops it and starts it again with the new limit, and it goes on from where it was (the log says "Stopped: the speed limit changed; starting again with it"). A live stream that is recording is the exception: restarting it would cut the recording, so it keeps recording and takes the limit the next time it starts. Under the limit for all downloads, such videos share it evenly: when another starts, the ones running with more than their share start again with it; when one ends, the others keep theirs. A gallery's pictures that MDM brings in follow a change at once; what gallery-dl still fetches itself starts again with the new limit, skipping the files already saved. Other changes (torrents taking more or less of the limit for all downloads, **Only while I'm using the computer**) apply to the next one that starts.
 
 ## Through a VPN's adapter
 

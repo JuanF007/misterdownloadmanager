@@ -31,6 +31,9 @@ fn main() -> ExitCode {
     if name.as_deref() == Some("fake-ytdlp") {
         return fake_ytdlp();
     }
+    if name.as_deref() == Some("fake-ffmpeg") {
+        return fake_ffmpeg();
+    }
     if std::env::var_os("MDM_SUBS_RETRY_SECS").is_some() {
         private_cookie_checks(&me);
         checks(&me);
@@ -39,6 +42,7 @@ fn main() -> ExitCode {
         list_checks(&me);
         preloaded_checks(&me);
         engine_checks(&me);
+        recording_checks(&me);
         long_name_checks(&me);
         saved_checks(&me);
         live_checks(&me);
@@ -178,6 +182,10 @@ fn fake_ytdlp() -> ExitCode {
             .and_then(|t| t.trim().parse::<u32>().ok())
             .unwrap_or(0);
         let _ = std::fs::write(&file, (n + 1).to_string());
+        // Every look-up after the first slow (3 s), when asked: a moment to act in between runs.
+        if n >= 1 && home.join("slow-second-look-up").exists() {
+            std::thread::sleep(Duration::from_secs(3));
+        }
         // #852: YouTube looked up without a JavaScript runtime, as yt-dlp says it.
         if args
             .last()
@@ -241,6 +249,57 @@ fn fake_ytdlp() -> ExitCode {
         .unwrap_or(0);
     std::fs::write(&tries, (tried + 1).to_string()).unwrap();
     let format = after("-f").unwrap_or_default();
+    // A live stream, recorded as yt-dlp's ffmpeg records one: into `<stem>.mp4.part` (written
+    // over, `-y`), MPEG-TS (`live`; `live-raw`: not), growing, saying nothing of its progress,
+    // never ending by itself (a minute at most). `live-dns-once`: its first run fails a while
+    // in, a media server no longer found. `live-ends`: the stream ends 3 s in, and yt-dlp
+    // finishes the file itself.
+    if mode.starts_with("live") {
+        use std::io::Write;
+        println!("MDMQ 96 1280x720");
+        let part = format!(
+            "{}.part",
+            template.replace("%(ext)s", "mp4").replace("%%", "%")
+        );
+        let mut packet = [0u8; 188];
+        if mode != "live-raw" {
+            packet[0] = 0x47;
+        }
+        let chunk = packet.repeat(348);
+        let mut file = std::fs::File::create(&part).unwrap();
+        let end = Instant::now() + Duration::from_secs(60);
+        let mut written = 0;
+        while Instant::now() < end {
+            file.write_all(&chunk).unwrap();
+            file.flush().unwrap();
+            written += chunk.len();
+            if mode == "live-dns-once" && tried == 0 && written >= 256 << 10 {
+                eprintln!(
+                    "ERROR: [download] Got error: HTTPSConnection(host='rr1---sn-dead.googlevideo.com', port=443): Failed to resolve 'rr1---sn-dead.googlevideo.com' ([Errno 11004] getaddrinfo failed). Giving up after 10 retries"
+                );
+                return ExitCode::FAILURE;
+            }
+            // The stream ends (3 s in): as yt-dlp says it once its ffmpeg is done, all of it
+            // in, then the file named and fixed up (`FixupM3u8`: an MP4 now), and said.
+            if mode == "live-ends" && written >= 30 * chunk.len() {
+                drop(file);
+                println!("MDMP {written} {written} NA 650000 96");
+                let video = template.replace("%(ext)s", "mp4").replace("%%", "%");
+                std::fs::rename(&part, &video).unwrap();
+                if args.iter().any(|a| a.starts_with("post_process:MDMM")) {
+                    println!("MDMM {video}");
+                }
+                let mut fixed = b"FAKEMP4 ".to_vec();
+                fixed.extend(std::fs::read(&video).unwrap());
+                std::fs::write(&video, fixed).unwrap();
+                println!("MDMF {video}");
+                return ExitCode::SUCCESS;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("ERROR: the fake live stream went on too long");
+        return ExitCode::FAILURE;
+    }
     // #94: the chosen height isn't offered (the reroute left it out); a fallback is.
     if mode == "unavailable" && format.contains("[height=") {
         eprintln!(
@@ -565,6 +624,54 @@ fn fake_list(list: &str, whole: bool, items: Option<String>) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// MDM's ffmpeg making a live stream's recording an MP4 (`-i file:<.part> … file:<out>`): the
+/// recording copied after a mark (`FAKEMP4 `, not MPEG-TS), taking a second. Its runs counted in
+/// `ffmpeg-runs.txt` beside the recording; `ffmpeg-mode.txt` there: `fail` (half written, then
+/// an error), `tiny` (a few bytes, no error) or `linger` (its file there 2 s before it ends).
+fn fake_ffmpeg() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let file = |a: &str| PathBuf::from(a.strip_prefix("file:").unwrap_or(a));
+    let input = args
+        .iter()
+        .position(|a| a == "-i")
+        .and_then(|i| args.get(i + 1))
+        .map(|a| file(a))
+        .expect("-i");
+    let output = file(args.last().expect("an output"));
+    let dir = input.parent().expect("a folder").to_owned();
+    let runs = dir.join("ffmpeg-runs.txt");
+    let n = std::fs::read_to_string(&runs)
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    std::fs::write(&runs, (n + 1).to_string()).unwrap();
+    let mode = std::fs::read_to_string(dir.join("ffmpeg-mode.txt")).unwrap_or_default();
+    let recorded = std::fs::read(&input).expect("the recording");
+    std::thread::sleep(Duration::from_secs(1));
+    match mode.trim() {
+        "fail" => {
+            std::fs::write(&output, &recorded[..recorded.len() / 2]).unwrap();
+            eprintln!("[mp4 @ 0000] Could not write header: Invalid argument");
+            ExitCode::FAILURE
+        }
+        "tiny" => {
+            std::fs::write(&output, b"FAKEMP4 ").unwrap();
+            ExitCode::SUCCESS
+        }
+        mode => {
+            let mut made = b"FAKEMP4 ".to_vec();
+            made.extend(recorded);
+            std::fs::write(&output, made).unwrap();
+            // Its file there a while before it ends (`linger`): long enough for another program
+            // to open it.
+            if mode == "linger" {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            ExitCode::SUCCESS
+        }
+    }
 }
 
 /// The fake, as a copy of this program named `fake-ytdlp` in `dir`.
@@ -1496,6 +1603,440 @@ fn engine_checks(me: &Path) {
     signed_in_checks(me, &lab, &engine);
     pieces_checks(me, &rt, &lab, &engine, &expected_audio());
     println!("fake_ytdlp: the engine's checks ok");
+}
+
+/// A live stream's recording, stopped and saved (`VideoJob::save`): yt-dlp (the fake, `live`
+/// modes) records `Talk.mp4.part` as MPEG-TS through MDM's engine's look-up path (the page says
+/// `is_live`), MDM's ffmpeg (the fake, as `fake-ffmpeg`) makes it an MP4. What it records shows
+/// as it grows; saved, it is a video and nothing else is left; whatever fails, nothing recorded
+/// is lost, and yt-dlp never starts again once saving.
+fn recording_checks(me: &Path) {
+    use mdm_tools::video::LiveState;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let engine = || mdm_tools::streams::Engine {
+        handle: rt.handle().clone(),
+        opts: mdm_engine::Options::default(),
+    };
+    const LIVE: &str = r#"{"id": "live", "title": "Live", "is_live": true, "ext": "mp4",
+        "formats": [{"format_id": "96", "ext": "mp4", "protocol": "m3u8"}]}"#;
+    // A folder for the fakes and one for the download, the fake recording as `mode`, MDM's
+    // ffmpeg as `ffmpeg_mode`.
+    let folders = |mode: &str, ffmpeg_mode: &str| {
+        let (tools, out) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(tools.path().join("page.json"), LIVE).unwrap();
+        std::fs::write(out.path().join("mode.txt"), mode).unwrap();
+        std::fs::write(out.path().join("ffmpeg-mode.txt"), ffmpeg_mode).unwrap();
+        let exe = fake_in(me, tools.path());
+        let ffmpeg = tools
+            .path()
+            .join(format!("fake-ffmpeg{}", std::env::consts::EXE_SUFFIX));
+        std::fs::copy(me, &ffmpeg).unwrap();
+        (tools, out, exe, ffmpeg)
+    };
+    let start = |exe: &Path, out: &Path, ffmpeg: Option<&Path>, by_engine: bool| {
+        VideoJob::start(
+            exe,
+            "https://video.example/live",
+            "b",
+            out,
+            "Talk",
+            None,
+            ffmpeg,
+            None,
+            &Default::default(),
+            &Subs::default(),
+            by_engine.then(engine),
+        )
+        .expect("started")
+    };
+    let until = |job: &VideoJob, what: &str, ok: &dyn Fn(&VideoJob) -> bool| {
+        let end = Instant::now() + Duration::from_secs(60);
+        while !ok(job) {
+            let p = job.progress();
+            assert!(
+                Instant::now() < end && p.state == State::Running,
+                "{what}: {:?} {:?}",
+                p.state,
+                log_of(&p)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let recording = |job: &VideoJob| job.live_state() == Some(LiveState::Recording);
+    let ended = |job: &VideoJob| {
+        let end = Instant::now() + Duration::from_secs(120);
+        loop {
+            let p = job.progress();
+            if p.state != State::Running {
+                return p;
+            }
+            assert!(Instant::now() < end, "still running: {:?}", log_of(&p));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let count = |file: PathBuf| {
+        std::fs::read_to_string(file)
+            .ok()
+            .and_then(|t| t.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    let names = |out: &Path| {
+        let mut n: Vec<String> = std::fs::read_dir(out)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.ends_with(".txt") && !n.ends_with(".log"))
+            .collect();
+        n.sort();
+        n
+    };
+    let ts = |len: usize| {
+        let mut packet = [0u8; 188];
+        packet[0] = 0x47;
+        packet.repeat(len.div_ceil(188))
+    };
+
+    // Saved: an MP4, nothing else left. What it records shows, growing, and is gone once over;
+    // saved twice and stopped while saving, it is saved once, and yt-dlp ran once.
+    let (_tools, out, exe, ffmpeg) = folders("live", "");
+    let job = start(&exe, out.path(), Some(&ffmpeg), true);
+    until(&job, "recording", &recording);
+    let first = job.progress().recorded;
+    until(&job, "grows", &|j: &VideoJob| j.progress().recorded > first);
+    assert_eq!(job.helper(), Some(mdm_tools::streams::Helper::Live));
+    job.save();
+    assert_eq!(job.live_state(), Some(LiveState::Saving));
+    assert_eq!(job.progress().state, State::Running, "saving: not over yet");
+    job.save();
+    job.stop();
+    assert_eq!(
+        job.live_state(),
+        Some(LiveState::Saving),
+        "a Stop changes nothing"
+    );
+    let p = ended(&job);
+    let log = log_of(&p);
+    assert_eq!(p.state, State::Done(out.path().join("Talk.mp4")), "{log:?}");
+    assert_eq!(names(out.path()), ["Talk.mp4"], "no .part, no temp");
+    let mp4 = std::fs::read(out.path().join("Talk.mp4")).unwrap();
+    assert!(
+        mp4.starts_with(b"FAKEMP4 ") && mp4[8] == 0x47,
+        "made by ffmpeg"
+    );
+    assert!(mp4.len() as u64 > first, "all of it");
+    assert_eq!(p.downloaded, mp4.len() as u64);
+    assert_eq!(p.recorded, 0, "no longer recording");
+    assert_eq!(job.live_state(), None);
+    assert_eq!(count(out.path().join("tries.txt")), 1, "yt-dlp ran once");
+    assert_eq!(count(out.path().join("ffmpeg-runs.txt")), 1, "saved once");
+    job.stop();
+    assert_eq!(job.progress().state, p.state, "done stays done");
+    println!(
+        "recording_checks: saved {} bytes as Talk.mp4 ({first} recorded at first)",
+        mp4.len()
+    );
+
+    // `Talk.mp4` there already: the recording beside it, out of MDM's numbering.
+    let (_tools, out, exe, ffmpeg) = folders("live", "");
+    std::fs::write(out.path().join("Talk.mp4"), b"another").unwrap();
+    let job = start(&exe, out.path(), Some(&ffmpeg), true);
+    until(&job, "recording", &recording);
+    job.save();
+    let p = ended(&job);
+    assert_eq!(
+        p.state,
+        State::Done(out.path().join("Talk (recording 1).mp4")),
+        "{:?}",
+        log_of(&p)
+    );
+    assert_eq!(
+        std::fs::read(out.path().join("Talk.mp4")).unwrap(),
+        b"another"
+    );
+    assert_eq!(names(out.path()), ["Talk (recording 1).mp4", "Talk.mp4"]);
+
+    // ffmpeg fails: kept as the MPEG-TS it is, its half-made MP4 gone.
+    let (_tools, out, exe, ffmpeg) = folders("live", "fail");
+    let job = start(&exe, out.path(), Some(&ffmpeg), true);
+    until(&job, "recording", &recording);
+    job.save();
+    let p = ended(&job);
+    let log = log_of(&p);
+    assert_eq!(p.state, State::Done(out.path().join("Talk.ts")), "{log:?}");
+    assert_eq!(names(out.path()), ["Talk.ts"]);
+    assert!(
+        log.iter()
+            .any(|t| t.starts_with("The recording couldn't be made an MP4 (")),
+        "{log:?}"
+    );
+
+    // ffmpeg's file far smaller than the recording: not taken, the recording kept whole.
+    let (_tools, out, exe, ffmpeg) = folders("live", "tiny");
+    let job = start(&exe, out.path(), Some(&ffmpeg), true);
+    until(&job, "recording", &recording);
+    job.save();
+    let p = ended(&job);
+    assert_eq!(p.state, State::Done(out.path().join("Talk.ts")));
+    assert_eq!(names(out.path()), ["Talk.ts"]);
+    let kept = std::fs::read(out.path().join("Talk.ts")).unwrap();
+    assert!(kept.len() >= 64 << 10 && kept[0] == 0x47, "{}", kept.len());
+
+    // Not MPEG-TS, and ffmpeg failed: never a file that isn't one; the recording stays as it
+    // is, and the error says where.
+    let (_tools, out, exe, ffmpeg) = folders("live-raw", "fail");
+    let job = start(&exe, out.path(), Some(&ffmpeg), true);
+    until(&job, "recording", &recording);
+    job.save();
+    let p = ended(&job);
+    let State::Failed(e) = &p.state else {
+        panic!("{:?}", p.state)
+    };
+    assert!(
+        e.contains("Talk.mp4.part") && e.contains("isn't MPEG-TS"),
+        "{e}"
+    );
+    assert_eq!(names(out.path()), ["Talk.mp4.part"]);
+    assert!(
+        std::fs::metadata(out.path().join("Talk.mp4.part"))
+            .unwrap()
+            .len()
+            > 0
+    );
+
+    // Saved before anything is recorded: a Stop.
+    let (_tools, out, exe, ffmpeg) = folders("live", "");
+    let job = start(&exe, out.path(), Some(&ffmpeg), true);
+    job.save();
+    assert_eq!(ended(&job).state, State::Stopped);
+    assert_eq!(count(out.path().join("ffmpeg-runs.txt")), 0);
+
+    // Without MDM's engine nothing says it's live: Save is a Stop, the recording stays.
+    let (_tools, out, exe, ffmpeg) = folders("live", "");
+    let job = start(&exe, out.path(), Some(&ffmpeg), false);
+    until(&job, "recorded", &|_: &VideoJob| {
+        std::fs::metadata(out.path().join("Talk.mp4.part")).is_ok_and(|m| m.len() > 0)
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(job.helper(), None);
+    assert_eq!(job.live_state(), None);
+    assert_eq!(job.progress().recorded, 0);
+    job.save();
+    assert_eq!(ended(&job).state, State::Stopped);
+    assert_eq!(names(out.path()), ["Talk.mp4.part"]);
+    assert_eq!(count(out.path().join("ffmpeg-runs.txt")), 0);
+
+    // Saved while the page is looked up again between two runs (the first failed): a Stop,
+    // and yt-dlp doesn't start again.
+    let (tools, out, exe, ffmpeg) = folders("live-dns-once", "");
+    std::fs::write(tools.path().join("slow-second-look-up"), "").unwrap();
+    let job = start(&exe, out.path(), Some(&ffmpeg), true);
+    until(&job, "looking up again", &|j: &VideoJob| {
+        log_of(&j.progress())
+            .iter()
+            .any(|t| t.ends_with("couldn't be reached; looking the page up again without it"))
+    });
+    assert_eq!(job.live_state(), None, "between runs: not recording");
+    job.save();
+    let p = ended(&job);
+    assert_eq!(p.state, State::Stopped, "{:?}", log_of(&p));
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(
+        count(out.path().join("tries.txt")),
+        1,
+        "yt-dlp didn't start again"
+    );
+    assert_eq!(names(out.path()), ["Talk.mp4.part"]);
+
+    // An earlier recording left there (Cancel, then Resume): kept aside before yt-dlp records
+    // over it, each time under a name of its own, never written over.
+    let (_tools, out, exe, ffmpeg) = folders("live", "");
+    let earlier = ts(100_000);
+    std::fs::write(out.path().join("Talk.mp4.part"), &earlier).unwrap();
+    let job = start(&exe, out.path(), Some(&ffmpeg), true);
+    until(&job, "recording", &recording);
+    let log = log_of(&job.progress());
+    assert!(
+        log.iter()
+            .any(|t| t == "The earlier recording was kept as Talk (recording 1).ts"),
+        "{log:?}"
+    );
+    job.stop();
+    assert_eq!(ended(&job).state, State::Stopped);
+    let second = std::fs::read(out.path().join("Talk.mp4.part")).unwrap();
+    let job = start(&exe, out.path(), Some(&ffmpeg), true);
+    until(&job, "recording", &recording);
+    job.stop();
+    assert_eq!(ended(&job).state, State::Stopped);
+    let read = |n: &str| std::fs::read(out.path().join(n)).unwrap();
+    assert_eq!(read("Talk (recording 1).ts"), earlier);
+    assert_eq!(read("Talk (recording 2).ts"), second);
+    assert_eq!(count(out.path().join("tries.txt")), 2);
+    // Another download of the same name, numbered by MDM (`Talk (2)`), in the same folder:
+    // none of these are its files, nor this download's own.
+    std::fs::write(out.path().join("Talk (2).mp4"), b"another").unwrap();
+    let theirs = mdm_tools::video::own_files(out.path(), "Talk (2)", true);
+    assert_eq!(theirs, [out.path().join("Talk (2).mp4")]);
+    let ours = mdm_tools::video::own_files(out.path(), "Talk", true);
+    assert!(
+        ours.iter()
+            .all(|f| !f.to_string_lossy().contains("(recording")),
+        "{ours:?}"
+    );
+
+    // The live stream ends by itself while recorded: yt-dlp's own file, no ffmpeg of MDM's.
+    // The size shown (the larger of what came and what is recorded) never falls back to
+    // nothing on the way from the recording to the end.
+    let (_tools, out, exe, ffmpeg) = folders("live-ends", "");
+    let job = start(&exe, out.path(), Some(&ffmpeg), true);
+    let end = Instant::now() + Duration::from_secs(60);
+    let (mut seen, mut dips, mut polls) = (false, 0, 0);
+    let p = loop {
+        let p = job.progress();
+        if p.state != State::Running {
+            break p;
+        }
+        if p.downloaded.max(p.recorded) > 0 {
+            seen = true;
+        } else if seen {
+            dips += 1;
+        }
+        polls += 1;
+        assert!(Instant::now() < end, "still running: {:?}", log_of(&p));
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(seen, "the recording was shown");
+    assert_eq!(
+        dips, 0,
+        "the size shown fell to 0 in {dips} of {polls} looks"
+    );
+    assert_eq!(
+        p.state,
+        State::Done(out.path().join("Talk.mp4")),
+        "{:?}",
+        log_of(&p)
+    );
+    let mp4 = std::fs::read(out.path().join("Talk.mp4")).unwrap();
+    assert!(mp4.starts_with(b"FAKEMP4 "), "yt-dlp's own");
+    assert_eq!((p.downloaded, p.recorded), (mp4.len() as u64, 0));
+    assert_eq!(names(out.path()), ["Talk.mp4"]);
+    assert_eq!(
+        count(out.path().join("ffmpeg-runs.txt")),
+        0,
+        "MDM's ffmpeg not run"
+    );
+    assert_eq!(count(out.path().join("tries.txt")), 1);
+    println!("recording_checks: a live stream that ended by itself, {polls} looks, no dip");
+
+    // Windows: an earlier recording another program holds (it can't be renamed): yt-dlp isn't
+    // started, the error names it, and it stays as it is.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_tools, out, exe, ffmpeg) = folders("live", "");
+        let part = out.path().join("Talk.mp4.part");
+        std::fs::write(&part, &earlier).unwrap();
+        // Shared for reading and writing, not for deleting (or renaming).
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&part)
+            .unwrap();
+        let job = start(&exe, out.path(), Some(&ffmpeg), true);
+        let p = ended(&job);
+        drop(held);
+        let State::Failed(e) = &p.state else {
+            panic!("{:?}", p.state)
+        };
+        assert!(e.contains("Talk.mp4.part"), "{e}");
+        assert_eq!(count(out.path().join("tries.txt")), 0, "yt-dlp not started");
+        assert_eq!(std::fs::read(&part).unwrap(), earlier);
+        assert_eq!(names(out.path()), ["Talk.mp4.part"]);
+    }
+
+    // Windows: another program holds the MP4 ffmpeg made (it can't be renamed, nor removed):
+    // the recording is kept as the MPEG-TS it is, byte for byte, and the leftover stays. Held
+    // by this program, not a child of ffmpeg's: ffmpeg runs in a job that ends all it started.
+    #[cfg(windows)]
+    {
+        use std::io::Read;
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_tools, out, exe, ffmpeg) = folders("live", "linger");
+        let job = start(&exe, out.path(), Some(&ffmpeg), true);
+        until(&job, "recording", &recording);
+        job.save();
+        let temp = out.path().join("Talk.temp.mp4");
+        let end = Instant::now() + Duration::from_secs(60);
+        let mut held = loop {
+            if std::fs::metadata(&temp).is_ok_and(|m| m.len() > 8) {
+                break std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0x1 | 0x2)
+                    .open(&temp)
+                    .unwrap();
+            }
+            assert!(Instant::now() < end, "no MP4 made");
+            assert_eq!(
+                job.progress().state,
+                State::Running,
+                "ended before it was held"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let p = ended(&job);
+        let log = log_of(&p);
+        let mut made = Vec::new();
+        held.read_to_end(&mut made).unwrap();
+        drop(held);
+        assert_eq!(p.state, State::Done(out.path().join("Talk.ts")), "{log:?}");
+        assert_eq!(
+            std::fs::read(out.path().join("Talk.ts")).unwrap(),
+            made[8..],
+            "the recording as ffmpeg read it"
+        );
+        assert_eq!(names(out.path()), ["Talk.temp.mp4", "Talk.ts"]);
+        assert!(
+            log.iter()
+                .any(|t| t.starts_with("The recording couldn't be made an MP4 (")
+                    && t.contains("Talk.temp.mp4 couldn't be renamed")),
+            "{log:?}"
+        );
+    }
+
+    // Windows: another program holds the recording once its MP4 is made (it can't be
+    // removed): saved all the same, the log says what is left.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_tools, out, exe, ffmpeg) = folders("live", "");
+        let job = start(&exe, out.path(), Some(&ffmpeg), true);
+        until(&job, "recording", &recording);
+        let part = out.path().join("Talk.mp4.part");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&part)
+            .unwrap();
+        job.save();
+        let p = ended(&job);
+        drop(held);
+        let log = log_of(&p);
+        assert_eq!(p.state, State::Done(out.path().join("Talk.mp4")), "{log:?}");
+        assert!(
+            log.iter().any(
+                |t| t.starts_with("The recording is saved, but its unfinished file")
+                    && t.contains("Talk.mp4.part couldn't be removed")
+            ),
+            "{log:?}"
+        );
+        let mp4 = std::fs::read(out.path().join("Talk.mp4")).unwrap();
+        assert_eq!(
+            mp4[8..],
+            std::fs::read(&part).unwrap(),
+            "all of it in the MP4"
+        );
+        assert_eq!(names(out.path()), ["Talk.mp4", "Talk.mp4.part"]);
+    }
+    println!("fake_ytdlp: the recordings' checks ok");
 }
 
 /// #1102: an X post with a long text, as the report's: its video saved in a deep folder (here,
