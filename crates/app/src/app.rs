@@ -642,8 +642,10 @@ enum AutoStop {
 /// MDM's own stop (`why`) leaves this download running: a live stream's recording being saved
 /// (a stop does nothing to it, and a start after a save that failed would record over what is
 /// left of it), and, for a new speed limit, a live stream being recorded (starting it again would
-/// end its recording: the limit applies from its next start). A network adapter change still
-/// restarts a recording (its next start sets the recording so far aside).
+/// end its recording: the limit applies from its next start). A recording counts from the moment
+/// its recorder opens its file, before its first block is written (0 bytes recorded): ffmpeg is
+/// connected and holds what it has read, which a restart would drop. A network adapter change
+/// still restarts a recording (its next start sets the recording so far aside).
 fn auto_stop_spares(why: AutoStop, live: Option<mdm_tools::video::LiveState>) -> bool {
     use mdm_tools::video::LiveState;
     match live {

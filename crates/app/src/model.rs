@@ -761,12 +761,13 @@ fn tool_snapshot(p: mdm_tools::video::Progress, url: &Url) -> mdm_engine::Snapsh
     // so Downloaded and the rate (from its growth) follow the recording.
     let downloaded = p.downloaded.max(p.recorded);
     // Downloaded by the helper itself (a live stream, RTMP; looking the page up): its one
-    // connection, not an empty list (#793); receiving once a live stream's recording grows,
-    // though yt-dlp gives it no speed.
+    // connection, not an empty list (#793); receiving once a live stream's recorder has opened
+    // its file (it is connected: `recording`, its file still 0 bytes until its first block) or
+    // its recording grows, though yt-dlp gives it no speed.
     let own = (p.engine.is_none() && state == State::Downloading).then(|| ConnView {
         id: 0,
         downloaded,
-        status: if p.speed > 0.0 || p.recorded > 0 {
+        status: if p.speed > 0.0 || p.recorded > 0 || p.recording {
             ConnStatus::Receiving
         } else {
             ConnStatus::Connecting
@@ -2084,6 +2085,7 @@ mod file_address_tests {
             merging: None,
             merge_failed: None,
             recorded: 0,
+            recording: false,
         };
         // Looking the page up: no stream yet.
         assert_eq!(tool_snapshot(p.clone(), &page).url, page);
@@ -2531,6 +2533,7 @@ mod helper_connection_tests {
             merging: None,
             merge_failed: None,
             recorded: 0,
+            recording: false,
         }
     }
 
@@ -2551,6 +2554,22 @@ mod helper_connection_tests {
         p.recorded = 0;
         p.downloaded = 0;
         assert_eq!(tool_snapshot(p, &page).downloaded, 0);
+    }
+
+    /// A live stream whose recorder has opened its file is receiving, though nothing is written
+    /// yet (the file stays 0 bytes until its first block): not "Connecting". Before that, it is
+    /// connecting.
+    #[test]
+    fn a_recorder_that_opened_its_file_is_receiving() {
+        let page: Url = "https://www.example.com/live".parse().unwrap();
+        let mut p = progress();
+        p.helper = Some(mdm_tools::streams::Helper::Live);
+        let s = tool_snapshot(p.clone(), &page);
+        assert!(matches!(s.connections[0].status, ConnStatus::Connecting));
+        p.recording = true;
+        let s = tool_snapshot(p, &page);
+        assert_eq!((s.downloaded, s.connections[0].downloaded), (0, 0));
+        assert!(matches!(s.connections[0].status, ConnStatus::Receiving));
     }
 
     /// A live stream recorded, stopped and saved: what it shows as downloaded never drops while

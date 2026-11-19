@@ -264,6 +264,9 @@ fn fake_ytdlp() -> ExitCode {
     // never ending by itself (a minute at most). `live-dns-once`: its first run fails a while
     // in, a media server no longer found. `live-ends`: the stream ends 3 s in, and yt-dlp
     // finishes the file itself. `live-split`: the picture and the sound recorded apart.
+    // `live-late`: as ffmpeg opens its file late and writes its first block later still: after
+    // `MDMQ` it waits (30 s at most) for `open.txt` in the folder, creates the `.part` empty, then
+    // waits (30 s at most) for `go.txt` before it writes as `live` does.
     if mode.starts_with("live") {
         use std::io::Write;
         println!("MDMQ 96 1280x720");
@@ -298,7 +301,26 @@ fn fake_ytdlp() -> ExitCode {
             eprintln!("ERROR: the fake live stream went on too long");
             return ExitCode::FAILURE;
         }
+        // `live-late`: a file that isn't there until the test says (`open.txt`) and holds nothing
+        // until it says again (`go.txt`).
+        let wait_for = |name: &str| {
+            let until = Instant::now() + Duration::from_secs(30);
+            while !dir.join(name).exists() {
+                if Instant::now() >= until {
+                    eprintln!("ERROR: the fake live stream waited too long for {name}");
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            true
+        };
+        if mode == "live-late" && !wait_for("open.txt") {
+            return ExitCode::FAILURE;
+        }
         let mut file = std::fs::File::create(&part).unwrap();
+        if mode == "live-late" && !wait_for("go.txt") {
+            return ExitCode::FAILURE;
+        }
         let end = Instant::now() + Duration::from_secs(60);
         let mut written = 0;
         while Instant::now() < end {
@@ -1762,7 +1784,25 @@ fn recording_checks(me: &Path) {
             std::thread::sleep(Duration::from_millis(50));
         }
     };
-    let recording = |job: &VideoJob| job.live_state() == Some(LiveState::Recording);
+    // Recording with something in: what the tests that save and expect an MP4 wait for (a
+    // recording is shown from the moment the recorder opens its file, its first block later).
+    let recording = |job: &VideoJob| {
+        job.live_state() == Some(LiveState::Recording) && job.progress().recorded > 0
+    };
+    // Recording, whatever has been written.
+    let opened = |job: &VideoJob| job.live_state() == Some(LiveState::Recording);
+    // For a while (twice the watcher's second) nothing says it records: it isn't, while the
+    // fake holds its file back. Not a wait for anything, the fake's files are what synchronize.
+    let not_recording = |job: &VideoJob, what: &str| {
+        let end = Instant::now() + Duration::from_millis(2500);
+        while Instant::now() < end {
+            let p = job.progress();
+            assert_eq!(p.state, State::Running, "{what}: {:?}", log_of(&p));
+            assert!(!p.recording, "{what}");
+            assert_eq!(job.live_state(), None, "{what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
     let ended = |job: &VideoJob| {
         let end = Instant::now() + Duration::from_secs(120);
         loop {
@@ -1909,6 +1949,105 @@ fn recording_checks(me: &Path) {
     job.save();
     assert_eq!(ended(&job).state, State::Stopped);
     assert_eq!(count(out.path().join("ffmpeg-runs.txt")), 0);
+
+    // The recorder connects first and opens its file later (`live-late`, the test says when with
+    // `open.txt`, then `go.txt` for its first block): nothing is recording while there is no
+    // file. A 0-byte `.part` an earlier run left (a stop in its first seconds) is removed before
+    // yt-dlp starts, so the new recording shows once its file is made, though empty (and not
+    // later, once it has grown).
+    let (_tools, out, exe, ffmpeg) = folders("live-late", "");
+    let part = out.path().join("Talk.mp4.part");
+    std::fs::write(&part, b"").unwrap();
+    let job = start(&exe, out.path(), Some(&ffmpeg), true);
+    until(&job, "started", &|_: &VideoJob| {
+        count(out.path().join("tries.txt")) > 0
+    });
+    not_recording(&job, "an earlier empty .part, before open.txt");
+    assert!(!part.exists(), "the earlier empty file is removed");
+    assert!(
+        log_of(&job.progress()).contains(
+            &"Removed the empty unfinished file Talk.mp4.part left by an earlier run".to_owned()
+        ),
+        "{:?}",
+        log_of(&job.progress())
+    );
+    std::fs::write(out.path().join("open.txt"), "").unwrap();
+    until(&job, "opened", &opened);
+    let p = job.progress();
+    assert_eq!((p.recorded, p.recording), (0, true));
+    assert_eq!(std::fs::metadata(&part).unwrap().len(), 0);
+    std::fs::write(out.path().join("go.txt"), "").unwrap();
+    until(&job, "recording", &recording);
+    job.stop();
+    assert_eq!(ended(&job).state, State::Stopped);
+
+    // No file yet, then an empty one: recording at 0 bytes. Stop and save keeps nothing, leaves
+    // the download stopped (to resume), the empty file as it is, no MP4, and ffmpeg unused.
+    let (_tools, out, exe, ffmpeg) = folders("live-late", "");
+    let job = start(&exe, out.path(), Some(&ffmpeg), true);
+    until(&job, "started", &|_: &VideoJob| {
+        count(out.path().join("tries.txt")) > 0
+    });
+    not_recording(&job, "no file yet");
+    assert!(!out.path().join("Talk.mp4.part").exists());
+    std::fs::write(out.path().join("open.txt"), "").unwrap();
+    until(&job, "opened", &opened);
+    let p = job.progress();
+    assert_eq!((p.recorded, p.recording), (0, true));
+    assert_eq!(
+        std::fs::metadata(out.path().join("Talk.mp4.part"))
+            .unwrap()
+            .len(),
+        0
+    );
+    job.save();
+    assert_eq!(
+        job.live_state(),
+        Some(LiveState::Saving),
+        "saved, not just stopped"
+    );
+    let p = ended(&job);
+    assert_eq!(p.state, State::Stopped, "{:?}", log_of(&p));
+    assert_eq!(
+        names(out.path()),
+        ["Talk.mp4.part"],
+        "no MP4, nothing deleted"
+    );
+    assert_eq!(
+        std::fs::metadata(out.path().join("Talk.mp4.part"))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        count(out.path().join("ffmpeg-runs.txt")),
+        0,
+        "ffmpeg not run"
+    );
+    assert_eq!(count(out.path().join("tries.txt")), 1, "yt-dlp ran once");
+    assert_eq!((p.recorded, p.recording), (0, false));
+    assert_eq!(job.live_state(), None);
+
+    // Another one: the file opened, then its first block: what is recorded shows, and Stop and
+    // save makes the MP4 as for any recording.
+    let (_tools, out, exe, ffmpeg) = folders("live-late", "");
+    let job = start(&exe, out.path(), Some(&ffmpeg), true);
+    std::fs::write(out.path().join("open.txt"), "").unwrap();
+    until(&job, "opened", &opened);
+    std::fs::write(out.path().join("go.txt"), "").unwrap();
+    until(&job, "recorded", &recording);
+    assert!(job.progress().recorded > 0);
+    job.save();
+    let p = ended(&job);
+    assert_eq!(
+        p.state,
+        State::Done(out.path().join("Talk.mp4")),
+        "{:?}",
+        log_of(&p)
+    );
+    assert_eq!(names(out.path()), ["Talk.mp4"]);
+    assert_eq!(count(out.path().join("ffmpeg-runs.txt")), 1);
+    assert_eq!((p.recorded, p.recording), (0, false));
 
     // Without MDM's engine nothing says it's live: Save is a Stop, the recording stays.
     let (_tools, out, exe, ffmpeg) = folders("live", "");

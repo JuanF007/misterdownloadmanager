@@ -599,6 +599,11 @@ These ship in the next version.
   record over it; a new speed limit no longer restarts a recording. Closing MDM while it records
   and the command line still don't save it
   ([#1450](https://github.com/anefzaoui/misterdownloadmanager/pull/1450))
+- ✅ A live stream being recorded says **Recording...** (and its connection Receiving) as soon as
+  the recorder has opened its file, a few seconds in, instead of "Connecting..." with 0 KB until
+  its first 256 KB block was written (some 15 s at 128 kbit/s, longer at lower bitrates); Stop and
+  save before that block keeps nothing yet and leaves the download stopped to resume
+  ([#1450](https://github.com/anefzaoui/misterdownloadmanager/pull/1450))
 - ✅ Download video: a video's own file (Kwai's MP4) is offered and downloaded when its server
   doesn't say it is a video, instead of "No video this can download on that page"; the button's
   click downloads such a file at once

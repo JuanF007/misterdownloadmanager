@@ -56,15 +56,28 @@ pub struct Progress {
     /// A live stream yt-dlp records: the size of its recording so far (its `.part`, read every
     /// second; yt-dlp says no progress while it records). 0 otherwise, and again once a run ends.
     pub recorded: u64,
+    /// A live stream yt-dlp records: the recorder has opened its file (ffmpeg connected and
+    /// created the `.part`, which stays 0 bytes until its first block, 256 KiB, is written), so
+    /// the recording has started whatever `recorded` says. False otherwise, and again once a run
+    /// ends.
+    pub recording: bool,
 }
 
 /// What a live stream's download does now ([`VideoJob::live_state`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiveState {
-    /// yt-dlp records it, and some of it is in: [`VideoJob::save`] keeps it.
+    /// yt-dlp records it: the recorder has opened its file ([`Progress::recording`]), though
+    /// what it has written ([`Progress::recorded`]) may still be 0. [`VideoJob::save`] keeps
+    /// what there is.
     Recording,
     /// Stopped and being saved: its recording made into the file kept.
     Saving,
+}
+
+/// Whether a live stream's recorder runs and has opened its file, or has written some of it:
+/// what [`LiveState::Recording`] and [`VideoJob::save`] both go by.
+fn is_recording(p: &Progress) -> bool {
+    p.helper == Some(crate::streams::Helper::Live) && (p.recorded > 0 || p.recording)
 }
 
 /// A subtitle language the site wouldn't give (#68).
@@ -718,11 +731,48 @@ fn keep_aside(
     Ok(())
 }
 
+/// An earlier run's recording parts of `<stem>` that are exactly 0 bytes (see [`recordings`]; one
+/// with yt-dlp's resume state beside it, its `.ytdl` or `.part-Frag` pieces, is a download to go
+/// on with, and stays) removed, the log saying so: the recorder creates its file empty once it has
+/// connected and writes its first block much later, so a stop before that leaves one, which holds
+/// nothing and would otherwise pass for the new recording's. The length is read again right
+/// before each removal, so nothing that holds anything is removed; one that can't be removed
+/// stays, and nothing stops for it.
+fn remove_empty_parts(dir: &Path, stem: &str, progress: &Mutex<Progress>) {
+    let names: Vec<String> = own_files(dir, stem, false)
+        .iter()
+        .map(|p| name_of(p).to_lowercase())
+        .collect();
+    for (part, len) in parts_of(dir, stem) {
+        let name = name_of(&part).to_lowercase();
+        let base = name.strip_suffix(".part").unwrap_or(&name);
+        let resumable = names
+            .iter()
+            .any(|n| *n == format!("{base}.ytdl") || n.starts_with(&format!("{name}-frag")));
+        if len == 0
+            && !resumable
+            && std::fs::metadata(&part).is_ok_and(|m| m.len() == 0)
+            && std::fs::remove_file(&part).is_ok()
+        {
+            note(
+                progress,
+                format!(
+                    "Removed the empty unfinished file {} left by an earlier run",
+                    name_of(&part)
+                ),
+            );
+        }
+    }
+}
+
 /// Before yt-dlp records a live stream again (Resume, another try): it would write its `.part`
 /// files over (ffmpeg `-y`), so every earlier recording left there (a stream's own part too) is
 /// kept aside first, each as `<stem> (recording N).ts`, and the log says so. One that isn't
 /// MPEG-TS, or can't be renamed: yt-dlp isn't started, and the error names it (none that isn't
-/// MPEG-TS is renamed; it stays as it is).
+/// MPEG-TS is renamed; it stays as it is). An earlier run's file that is empty (a stop in its
+/// first seconds, before the recorder's first block) holds nothing to keep: it is removed
+/// ([`remove_empty_parts`]), so the recording that starts now is told from it by its file
+/// being created.
 fn set_aside_recordings(ours: &[String], progress: &Mutex<Progress>) -> Result<(), String> {
     let Some((dir, stem)) = template_of(ours) else {
         return Ok(());
@@ -733,6 +783,7 @@ fn set_aside_recordings(ours: &[String], progress: &Mutex<Progress>) -> Result<(
             part.display()
         )
     };
+    remove_empty_parts(&dir, &stem, progress);
     // Nothing recorded in one: nothing to lose.
     let parts: Vec<PathBuf> = parts_of(&dir, &stem)
         .into_iter()
@@ -1655,6 +1706,19 @@ fn run(
     mut meter: Option<&mut Meter>,
     recorder: &Recorder,
 ) -> Result<Option<Ran>, String> {
+    // A live stream yt-dlp records: what it says nothing of, its recording's size tells. What is
+    // in the folder before yt-dlp starts is not the recorder's (taken before the spawn: the
+    // recorder can't have made its file yet, and the watcher's thread may start late; no test
+    // checks "before the spawn" itself, the fake can't be made to race it). An earlier run's
+    // empty file is removed before this (`set_aside_recordings`), so what is left here is a file
+    // that couldn't be removed, or one that holds something.
+    let recording = (progress.lock().unwrap().helper == Some(crate::streams::Helper::Live))
+        .then(|| template_of(ours))
+        .flatten()
+        .map(|(dir, stem)| {
+            let before = parts_of(&dir, &stem);
+            (dir, stem, before)
+        });
     let stdout = {
         // Under the child's lock: stop() and save() either came first (nothing starts) or find
         // the child to kill.
@@ -1679,14 +1743,10 @@ fn run(
     // The merge's file, once yt-dlp says it's next; watched until the reading ends.
     let merged: Mutex<Option<PathBuf>> = Mutex::new(None);
     let read_all = std::sync::atomic::AtomicBool::new(false);
-    // A live stream yt-dlp records: what it says nothing of, its recording's size tells.
-    let recording = (progress.lock().unwrap().helper == Some(crate::streams::Helper::Live))
-        .then(|| template_of(ours))
-        .flatten();
     std::thread::scope(|scope| {
         scope.spawn(|| watch_merge(&merged, &read_all, progress));
-        if let Some((dir, stem)) = &recording {
-            scope.spawn(|| watch_recording(dir, stem, &read_all, progress));
+        if let Some((dir, stem, before)) = &recording {
+            scope.spawn(|| watch_recording(dir, stem, before, &read_all, progress));
         }
         // Every line to the end, read as bytes (#79): a line that isn't UTF-8 (a title in a
         // legacy code page) used to end the reading there, while yt-dlp went on; it is read
@@ -1747,6 +1807,7 @@ fn run(
         let mut p = progress.lock().unwrap();
         // The run is over: nothing records now, so save() is a Stop from here.
         p.recorded = 0;
+        p.recording = false;
         if p.state == State::Stopped {
             return Ok(None);
         }
@@ -1812,10 +1873,15 @@ fn watch_merge(
 
 /// A live stream's recording, yt-dlp's `.part` files in `dir` for `<stem>` ([`parts_of`]; the
 /// picture's and the sound's, when it records them apart): their size together into `recorded`
-/// every second. Ends when the reading does.
+/// every second, and `recording` once the recorder has opened its file: a part that wasn't there
+/// before the run (`before`; ffmpeg creates it, 0 bytes, once it has connected, and writes its
+/// first block much later) or one that holds something. A 0-byte part that was already there
+/// (one an earlier run left and [`remove_empty_parts`] couldn't remove) doesn't count until it
+/// grows. Ends when the reading does.
 fn watch_recording(
     dir: &Path,
     stem: &str,
+    before: &[(PathBuf, u64)],
     read_all: &std::sync::atomic::AtomicBool,
     progress: &Mutex<Progress>,
 ) {
@@ -1825,7 +1891,12 @@ fn watch_recording(
             next = Instant::now() + Duration::from_secs(1);
             let parts = parts_of(dir, stem);
             if !parts.is_empty() {
-                progress.lock().unwrap().recorded = parts.iter().map(|(_, len)| len).sum();
+                let opened = parts
+                    .iter()
+                    .any(|(p, len)| *len > 0 || !before.iter().any(|(b, _)| b == p));
+                let mut p = progress.lock().unwrap();
+                p.recorded = parts.iter().map(|(_, len)| len).sum();
+                p.recording |= opened;
             }
         }
         // A tenth of a second at a time: the run's end isn't kept waiting.
@@ -2699,6 +2770,7 @@ impl VideoJob {
             merging: None,
             merge_failed: None,
             recorded: 0,
+            recording: false,
         }));
         let recorder = Arc::new(Recorder {
             saving: std::sync::atomic::AtomicBool::new(false),
@@ -2802,9 +2874,11 @@ impl VideoJob {
         self.progress.lock().unwrap().helper.clone()
     }
 
-    /// Stop and save: a live stream yt-dlp records (some of it in) is stopped and its recording
-    /// kept as a video, the download then done ([`finish_recording`]); yt-dlp never starts again
-    /// for it. Anything else: [`VideoJob::stop`]. Again while saving: nothing more.
+    /// Stop and save: a live stream yt-dlp records (its recorder has opened its file) is stopped
+    /// and its recording kept as a video, the download then done ([`finish_recording`]); yt-dlp
+    /// never starts again for it. Before the recorder's first block is written there is nothing
+    /// to keep: it ends stopped, with the empty file left as it is, to resume. Anything else:
+    /// [`VideoJob::stop`]. Again while saving: nothing more.
     pub fn save(&self) {
         {
             // Under the child's lock, as a run starts: it is recording, or it is a Stop.
@@ -2813,10 +2887,7 @@ impl VideoJob {
             if self.recorder.saving() {
                 return;
             }
-            let recording = slot.is_some()
-                && p.state == State::Running
-                && p.helper == Some(crate::streams::Helper::Live)
-                && p.recorded > 0;
+            let recording = slot.is_some() && p.state == State::Running && is_recording(&p);
             if recording {
                 self.recorder
                     .saving
@@ -2833,15 +2904,15 @@ impl VideoJob {
         self.stop();
     }
 
-    /// A live stream's download: recording (some of it in), being saved, or neither (`None`:
-    /// not a live stream, not started recording, or over).
+    /// A live stream's download: recording (the recorder has opened its file), being saved, or
+    /// neither (`None`: not a live stream, not started recording, or over).
     pub fn live_state(&self) -> Option<LiveState> {
         let p = self.progress.lock().unwrap();
         if p.state != State::Running {
             None
         } else if self.recorder.saving() {
             Some(LiveState::Saving)
-        } else if p.helper == Some(crate::streams::Helper::Live) && p.recorded > 0 {
+        } else if is_recording(&p) {
             Some(LiveState::Recording)
         } else {
             None
@@ -3149,6 +3220,7 @@ mod tests {
             merging: None,
             merge_failed: None,
             recorded: 0,
+            recording: false,
         };
         // `MDMQ …` as yt-dlp prints it before it downloads; every other line is an `MDMP` one's.
         lines
@@ -4020,10 +4092,14 @@ mod tests {
                 "The earlier recording was kept as Talk (recording 2).ts"
             ]
         );
-        // Empty: nothing to keep, left for yt-dlp to write over.
+        // Empty: nothing to keep, removed (the recorder creates its own).
         std::fs::write(&part, b"").unwrap();
         assert_eq!(set_aside_recordings(&ours, &progress), Ok(()));
-        assert!(part.is_file());
+        assert!(!part.exists());
+        assert_eq!(
+            log(&progress).last().unwrap(),
+            "Removed the empty unfinished file Talk.mp4.part left by an earlier run"
+        );
         // Not MPEG-TS: refused, named, left as it is.
         std::fs::write(&part, vec![1u8; 1000]).unwrap();
         let e = set_aside_recordings(&ours, &progress).unwrap_err();
@@ -4064,6 +4140,52 @@ mod tests {
             ts(500)
         );
         assert!(!video.exists() && !audio.exists());
+    }
+
+    /// A live stream's earlier run left empty files (stopped before the recorder's first block):
+    /// removed before it records again, none that holds anything, none with yt-dlp's resume state
+    /// beside it, none of MDM's own (`.mdm.part`) nor of another download's name.
+    #[test]
+    fn an_earlier_runs_empty_recording_is_removed_and_nothing_else() {
+        let progress = Mutex::new(Progress::default());
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let ours = template(d);
+        let write = |name: &str, bytes: &[u8]| std::fs::write(d.join(name), bytes).unwrap();
+        write("Talk.mp4.part", b"");
+        write("Talk.f1.mp4.part", b"");
+        write("Talk.f1.mp4.ytdl", b"{}");
+        write("Talk.f2.m4a.part", b"");
+        write("Talk.f2.m4a.part-Frag0", b"x");
+        write("Talk.f3.m4a.part", &ts(500));
+        write("Talk.mp4.mdm.part", b"");
+        write("Other.mp4.part", b"");
+        assert_eq!(set_aside_recordings(&ours, &progress), Ok(()));
+        // Only the empty `Talk.mp4.part` went; the one holding something was kept aside (the
+        // rest of the folder is as it was).
+        assert_eq!(
+            listed(d),
+            [
+                "Other.mp4.part",
+                "Talk (recording 1).ts",
+                "Talk.f1.mp4.part",
+                "Talk.f1.mp4.ytdl",
+                "Talk.f2.m4a.part",
+                "Talk.f2.m4a.part-Frag0",
+                "Talk.mp4.mdm.part"
+            ]
+        );
+        assert_eq!(
+            std::fs::read(d.join("Talk (recording 1).ts")).unwrap(),
+            ts(500)
+        );
+        assert_eq!(
+            log(&progress),
+            [
+                "Removed the empty unfinished file Talk.mp4.part left by an earlier run",
+                "The earlier recording was kept as Talk (recording 1).ts"
+            ]
+        );
     }
 
     /// Before any run of a video: a plain `.part` an earlier run left that is MPEG-TS, with no

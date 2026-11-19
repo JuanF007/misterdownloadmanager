@@ -479,6 +479,7 @@ impl Default for Progress {
             merging: None,
             merge_failed: None,
             recorded: 0,
+            recording: false,
         }
     }
 }
