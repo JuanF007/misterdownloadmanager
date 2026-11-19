@@ -574,6 +574,13 @@ These ship in the next version.
   record over it; a new speed limit no longer restarts a recording. Closing MDM while it records
   and the command line still don't save it
   ([#1450](https://github.com/anefzaoui/misterdownloadmanager/pull/1450))
+- ✅ Download video: a video's own file (Kwai's MP4) is offered and downloaded when its server
+  doesn't say it is a video, instead of "No video this can download on that page"; the button's
+  click downloads such a file at once
+  ([#1458](https://github.com/anefzaoui/misterdownloadmanager/issues/1458))
+- ✅ Your own yt-dlp config file: Options → Sites Logins → Use my yt-dlp config file (off by
+  default) lets yt-dlp read it for the app's videos, most of MDM's own choices still winning; an
+  external downloader it names doesn't stop the progress
 - ✅ Download File Info: a name typed in **Save as** that is a file already there asks first
   (the duplicate question: a numbered name, or overwrite it, replaced only once the download
   completes), instead of numbering it without a word
