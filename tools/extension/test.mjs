@@ -5216,6 +5216,11 @@ const MP4 = (() => {
   assert.equal(choose([signed("q1w2", 1000), signed("z9x8", 4000)], { duration: 600 }), "several 2", "seconds apart");
   assert.equal(choose([signed("q1w2", 1000), signed("z9x8", 3 * HOUR)], { duration: 600, began: 900, nextBegan: 5000 }), "several 2", "after the next player began");
   assert.equal(choose([signed("q1w2", 1000), signed("z9x8", 3 * HOUR, "hls-cdn1", "cd")], { duration: 600 }), "several 2", "another video's part");
+  // The same path on another site: two videos.
+  assert.equal(choose([signed("q1w2", 1000), stream("https://hls.other.test/z9x8-1700000000/videos/ab/hls.m3u8", 600, { at: 3 * HOUR })], { duration: 600 }), "several 2", "another site");
+  // Signed in its query the way S3 and Google Cloud Storage sign (X-Amz-…, X-Goog-…): one video.
+  const s3 = (sig, at) => stream(`https://b.s3.test/v/ab/hls.m3u8?X-Amz-Date=${at}&X-Amz-Signature=${sig}`, 600, { at });
+  assert.equal(choose([s3("a", 1000), s3("b", 3 * HOUR)], { duration: 600 }), `https://b.s3.test/v/ab/hls.m3u8?X-Amz-Date=${3 * HOUR}&X-Amz-Signature=b`, "S3-signed");
   const byId = (id, at) => stream(`https://cdn.v.test/master.m3u8?id=${id}&hash=x`, 600, { at });
   assert.equal(choose([byId(1, 1000), byId(2, 3 * HOUR)], { duration: 600 }), "several 2");
   const index = stream("https://hls-cdn1.cdn.test/z9-1/videos/ab/index.m3u8", 600, { at: 3 * HOUR });

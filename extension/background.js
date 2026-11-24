@@ -1783,6 +1783,10 @@ function loadedAgain(older, newer, v) {
   } catch {
     return false;
   }
+  // The host but for its first label: `hls-cdn1.cdn.test` and `hls-cdn7.cdn.test` are one site. It
+  // knows no public suffixes, so `a.co.uk` and `b.co.uk` are one "site" (`co.uk`) too: the same
+  // file at the end, the same path but one part, the query and the length still have to match, so
+  // two videos from there are never taken for one.
   const site = (u) => {
     const labels = u.hostname.split(".");
     return /^[\d.]+$|:/.test(u.hostname) || labels.length < 3 ? u.hostname : labels.slice(1).join(".");
