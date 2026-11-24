@@ -145,6 +145,8 @@ MDM runs on Linux too, tested on Ubuntu 24.04, Debian 12 and Fedora with GNOME, 
 and Cinnamon, on X11 and in Wayland sessions: the tray, dark mode, browser integration (Ubuntu's
 Snap Firefox included) and the packages' installs. Not there yet: screen readers (Orca) don't
 read its windows, and Flatpak browsers can't reach it ([more](docs/getting-started.md#on-linux)).
+Running downloads show their progress on MDM's icon in the dock (Ubuntu Dock, KDE Plasma and
+other docks that can show it), as they do on the Windows taskbar and in the macOS Dock.
 Up to version 0.2.4, the files' names end in `-experimental`.
 
 | File | For |
@@ -310,9 +312,10 @@ right-to-left window.
   when MDM isn't running.
 - **Downloads videos** from web pages (a button appears over the video; playlists, subtitles,
   the sound alone), **image galleries** with gallery-dl, and **torrents and magnet links**
-  (sequential order, RSS feeds, sharing limits).
+  (sequential order, RSS feeds, sharing limits, an optional public tracker list for more peers).
 - **Many links at once**: the Link grabber sorts them into packages and extracts the archives
-  (zip, 7z, rar) when they're in. It takes Click'n'Load from link sites, asking once per site. Debrid accounts (Real-Debrid, AllDebrid, Premiumize, TorBox, Mega-Debrid; experimental) download
+  (zip, 7z, rar) when they're in. It takes Click'n'Load from link sites, asking once per site, and
+  unwraps `thunder://`, `flashget://` and `qqdl://` links to the address inside them. Debrid accounts (Real-Debrid, AllDebrid, Premiumize, TorBox, Mega-Debrid; experimental) download
   file-host links through your own account.
 - **Downloads overnight** with queues and a scheduler that can wake the computer, then shuts it
   down if you like.
