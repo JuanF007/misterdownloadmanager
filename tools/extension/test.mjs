@@ -36,6 +36,7 @@ function fakeApi({
   // Options → Download panels → Button size (#1278): Compact (a function: the app's answer now);
   // undefined: an older host, which doesn't say.
   panelCompact,
+  panelFull,
   access = true,
   rules = {},
   rulesReply,
@@ -56,6 +57,8 @@ function fakeApi({
   pageLinks = ["https://x/1.zip", "https://x/2.zip"],
   // tabs.query's answer for the active tab of the window last used (#607).
   activeTab,
+  // runtime.connectNative (#1496): a port to the host, answered as sendNativeMessage answers.
+  nativePort = false,
 }) {
   const raw = [];
   // Objects made inside the sandbox have its prototypes: compare plain copies.
@@ -154,7 +157,8 @@ function fakeApi({
         if (m.panel) {
           const on = typeof panelOn === "function" ? panelOn(m) : panelOn !== false;
           const compact = typeof panelCompact === "function" ? panelCompact(m) : panelCompact;
-          return { ok: on, ...(on && compact !== undefined ? { compact } : {}) };
+          const full = typeof panelFull === "function" ? panelFull(m) : panelFull;
+          return { ok: on, ...(on && compact !== undefined ? { compact } : {}), ...(on && full !== undefined ? { full } : {}) };
         }
         // A notice of a download left alone (#208): an older host, which knows none, takes it
         // for an address it can't download (`noticeReply`).
@@ -174,6 +178,7 @@ function fakeApi({
       onInstalled: event("installed"),
       onStartup: event("startup"),
       onMessage: event("message"),
+      onConnect: event("connect"),
       id: "ours",
       getURL: (p) => `chrome-extension://ours/${p}`,
     },
@@ -226,6 +231,21 @@ function fakeApi({
     // The browser's language: German here.
     i18n: { getMessage: (key) => ({ menu: "Mit Mister Download Manager herunterladen" })[key] ?? "" },
   };
+  if (nativePort) {
+    api.runtime.connectNative = (name) => {
+      calls.push(["port-open"]);
+      const heard = [];
+      const ended = [];
+      return {
+        onMessage: { addListener: (f) => heard.push(f) },
+        onDisconnect: { addListener: (f) => ended.push(f) },
+        postMessage: (m) => {
+          api.runtime.sendNativeMessage(name, m).then((r) => setTimeout(() => heard.forEach((f) => f(JSON.parse(JSON.stringify(r)))), 1));
+        },
+        disconnect: () => calls.push(["port-closed"]),
+      };
+    };
+  }
   if (safari) delete api.downloads;
   if (!firefox && !safari) api.declarativeNetRequest = { getSessionRules: async () => [], updateSessionRules: async (r) => calls.push(["dnr", r]) };
   if (appName) api.runtime.getBrowserInfo = async () => ({ name: appName, vendor: "Mozilla", version: "1.0" });
@@ -311,7 +331,9 @@ function load(api, firefox, extra = {}) {
 const settle = () => new Promise((r) => setTimeout(r, 30));
 // The messages to the host about downloads, and apart, the notices of downloads the extension
 // left to the browser by Options (#208).
-const natives = (calls) => calls.filter((c) => c[0] === "native" && !c[2].declined).map((c) => c[2]);
+// The list's questions (#1496: the toolbar button's count, asked after a download is handed
+// over) are apart too.
+const natives = (calls) => calls.filter((c) => c[0] === "native" && !c[2].declined && !c[2].recent).map((c) => c[2]);
 const notices = (calls) => calls.filter((c) => c[0] === "native" && c[2].declined).map((c) => c[2].declined);
 const steps = (calls) => calls.filter((c) => ["pause", "cancel", "erase", "resume", "removeFile"].includes(c[0])).map((c) => c[0]);
 let passed = 0;
@@ -950,6 +972,14 @@ const ok = (what) => {
   assert.equal(own.url, "https://tube.test/watch?v=abc123", "the video's own page");
   assert.equal(own.referrer, "https://blog.test/post");
   assert.equal(own.cookies, "sid=1");
+  // #1662: "Download a part from here...": the second the player was at goes with it, as a whole
+  // number of seconds; anything else doesn't.
+  assert.equal((await ask({ type: "video", url: "https://tube.test/watch?v=abc123", part: 95 })).ok, true);
+  assert.equal(natives(calls).filter((m) => m.video).at(-1).part, 95, "the part's start goes to the app");
+  for (const part of [-1, 1.5, "95", null]) {
+    await ask({ type: "video", url: "https://tube.test/watch?v=abc123", part });
+    assert.equal(natives(calls).filter((m) => m.video).at(-1).part, undefined, `no part from ${JSON.stringify(part)}`);
+  }
   // Another site's address is not the page's: ignored, as any message content was before.
   assert.equal((await ask({ type: "video", url: "https://evil.test/watch?v=abc123" })).ok, true);
   assert.equal(
@@ -1085,7 +1115,17 @@ const ok = (what) => {
   const older = fakeApi({ firefox: false, panelOn: () => true });
   load(older.api, false);
   const said = await new Promise((r) => older.listeners.message({ type: "panel" }, page, (v) => r(JSON.parse(JSON.stringify(v)))));
-  assert.deepEqual(said, { on: true, compact: false }, "an older host: Full");
+  assert.deepEqual(said, { on: true, compact: false }, "an older host: Automatic (video.js sizeMode)");
+  // Full chosen (a newer app says it): said, and kept with the answer; not chosen: not said.
+  let full = true;
+  const newer = fakeApi({ firefox: false, panelOn: () => true, panelCompact: () => false, panelFull: () => full });
+  load(newer.api, false, { Date: FakeDate });
+  const askNewer = () => new Promise((r) => newer.listeners.message({ type: "panel" }, page, (v) => r(JSON.parse(JSON.stringify(v)))));
+  assert.deepEqual(await askNewer(), { on: true, compact: false, full: true });
+  full = false;
+  assert.deepEqual(await askNewer(), { on: true, compact: false, full: true }, "kept a moment");
+  clock.t += 6000;
+  assert.deepEqual(await askNewer(), { on: true, compact: false }, "Automatic again");
   ok("#1278: the video button's size comes from Options with its answer, and follows a change");
 }
 {
@@ -2233,6 +2273,80 @@ function samplePage(html) {
   ok(`#689: a video in a feed names its post, never the feed (${pages.length} sample pages, ${checked} videos)`);
 }
 
+// #643: Facebook's feed as it is built in 2026 (our own synthetic posts, no real one). The <video>
+// sits `depth` levels below its post (aria-posinset: 21 to 24), the id its player's wrapper carries
+// (data-video-id) about 10 above it, before it plays. The timestamp link is a placeholder
+// (?__cft__…, or the home page with it) until hovered or focused, then the video's /reel/<id>/;
+// a comment's timestamp can be another video's reel (…?comment_id=…). What the button sends.
+{
+  const post = ({ id = null, idAt = 10, depth = 24, head = [], comment = null, inner = "" } = {}) => {
+    let player = "<video></video>";
+    for (let level = 1; level <= depth - 2; level += 1) {
+      const named = (Array.isArray(id) ? id : [[idAt, id]]).find(([at, v]) => at === level && v);
+      player = `<div${named ? ` data-video-id="${named[1]}"` : ""}>${player}${level === 3 ? inner : ""}</div>`;
+    }
+    return `<div aria-posinset="1"><div><h4><a href="https://www.facebook.com/sample.page?__cft__[0]=AZ">Sample Page</a></h4>
+      <span>${head.map((h) => `<a href="${h}">4h</a>`).join(" ")}</span>${player}
+      ${comment ? `<ul><li><a href="${comment}">1d</a></li></ul>` : ""}</div></div>`;
+  };
+  const send = (html, at = "https://www.facebook.com/") => {
+    const { document, videos } = samplePage(`<html><head><meta name="mdm-page" content="${at}"></head><body><div role="main"><div role="feed">${html}</div></div></body></html>`);
+    return videoPageOn(new URL(at), document)(videos[0]);
+  };
+  const ID = "8901234567890123";
+  const OTHER = "9012345678901234";
+  const reel = (id) => `https://www.facebook.com/reel/${id}/`;
+  const placeholders = ["?__cft__[0]=AZsample&__tn__=%2CO%2CP-R", "https://www.facebook.com/?__cft__[0]=AZsample"];
+  const hovered = (id) => `https://www.facebook.com/reel/${id}/?__cft__[0]=AZsample&__tn__=%2CO%2CP-R`;
+  const commentOf = (id) => `https://www.facebook.com/reel/${id}/?comment_id=Y29tbWVudDpzYW1wbGU%3D&__cft__[0]=AZsample`;
+
+  // An ordinary video post before it is hovered: its wrapper's id, as /reel/<id>/.
+  assert.equal(send(post({ id: ID, head: placeholders })), reel(ID), "data-video-id 10 up, placeholders");
+  // Hovered: its timestamp names the same video.
+  assert.equal(send(post({ id: ID, head: [hovered(ID)] })), reel(ID));
+  // A comment's reel link names another video: the post's own id still decides.
+  assert.equal(send(post({ id: ID, head: placeholders, comment: commentOf(OTHER) })), reel(ID));
+  // The nearest id up decides (an outer one is something else's).
+  assert.equal(send(post({ id: [[10, ID], [14, OTHER]], head: placeholders })), reel(ID), "the nearest data-video-id");
+  // No id: the hovered timestamp, 22 levels up (beyond the old 16-level walk), inside its post.
+  assert.equal(send(post({ head: [hovered(ID)] })), reel(ID), "the timestamp link at the post's depth");
+  assert.equal(send(post({ head: [hovered(ID)], comment: commentOf(OTHER) })), reel(ID), "the post's link, not its comment's");
+  // No id, placeholders only, and a comment's reel: nothing (never the comment's video, nor the feed).
+  assert.equal(send(post({ head: placeholders })), null, "placeholders name nothing");
+  assert.equal(send(post({ head: placeholders, comment: commentOf(OTHER) })), null, "a comment's reel isn't the post's video");
+  // The same in a shallower post (12 levels), which the old walk reached.
+  assert.equal(send(post({ depth: 12, head: placeholders, comment: commentOf(OTHER) })), null, "a comment's reel, 12 levels up");
+  assert.equal(send(post({ depth: 12, head: [hovered(ID)], comment: commentOf(OTHER) })), reel(ID), "the post's reel beside a comment's");
+  // On another page too: a placeholder resolves against the page's address, and names nothing.
+  assert.equal(send(post({ head: ["?__cft__[0]=AZsample"] }), "https://www.facebook.com/groups/123456789012/"), null);
+  // A sponsored post: no id, no video link (the advertiser's page, an outside link).
+  const sponsored = post({ head: ["?__cft__[0]=AZsample", "https://www.facebook.com/sample.advertiser?__cft__[0]=AZ", "https://l.facebook.com/l.php?u=https%3A%2F%2Fshop.example.test%2F&h=AT0"] });
+  assert.equal(send(sponsored), null, "a sponsored post names nothing");
+  // The video's other links, in the post, as before: a watch page, video.php, a page's video, fb.watch.
+  assert.equal(send(post({ head: ["https://www.facebook.com/watch/?v=1234567890123456&__cft__[0]=AZ"] })), "https://www.facebook.com/watch/?v=1234567890123456");
+  assert.equal(send(post({ head: ["https://www.facebook.com/video.php?v=1234567890123456"] })), "https://www.facebook.com/watch/?v=1234567890123456");
+  assert.equal(send(post({ head: ["https://www.facebook.com/sample.page/videos/a-title/1234567890123456/?__cft__[0]=AZ"] })), "https://www.facebook.com/watch/?v=1234567890123456");
+  assert.equal(send(post({ head: ["https://fb.watch/sAmPlE7x/?mibextid=sample"] })), "https://fb.watch/sAmPlE7x/");
+  // A post's permalink is the last resort: a video link anywhere in the post goes first, even one
+  // further from the <video> than the permalink.
+  const permalink = "https://www.facebook.com/sample.page/posts/pfbid02SampleSampleSampleSampleSampleSample1l";
+  assert.equal(send(post({ head: [permalink] })), permalink, "only a permalink: the post");
+  assert.equal(send(post({ head: [hovered(ID)], inner: `<a href="${permalink}?__cft__[0]=AZ">See more</a>` })), reel(ID), "a video link over a nearer permalink");
+  assert.equal(send(post({ id: ID, head: [permalink] })), reel(ID));
+  // A permalink in a comment is no post's either.
+  assert.equal(send(post({ head: placeholders, comment: `${permalink}?comment_id=Y29tbWVudA%3D%3D` })), null);
+  // The walk ends at the post: the next post's link is never this video's.
+  const two = `${post({ head: placeholders })}<div aria-posinset="2"><div><span><a href="${hovered(OTHER)}">2h</a></span></div></div>`;
+  assert.equal(send(`<div>${two}</div>`), null, "nothing past the post");
+  // Without a post container the walk keeps its 16 levels: a link 22 up names nothing.
+  const bare = post({ head: [hovered(ID)] }).replace('aria-posinset="1"', 'class="x1"');
+  assert.equal(send(bare), null, "no post container: 16 levels, as before");
+  // m. and web. are the same site.
+  assert.equal(send(post({ id: ID, head: placeholders }), "https://m.facebook.com/"), reel(ID));
+  assert.equal(send(post({ id: ID, head: placeholders }), "https://web.facebook.com/"), reel(ID));
+  ok("#643: Facebook's feed: the player's id, then the post's video links, its permalink last");
+}
+
 // #1458: Kwai's video page (our own sample of its player's shape: no real account or video) plays
 // its video's plain MP4 in a <video src>, a signed `?tag=` after it, the next one ready below it.
 // Each names the page (which yt-dlp can't read: it has no Kwai reader), and its own file goes with
@@ -3014,6 +3128,34 @@ function videoButton({ stored = {}, location, iframes, videos, subframe = false 
   assert.equal(pointerTarget(next, null, false), next);
   assert.equal(pointerTarget(null, mine, false), null);
   assert.ok(fn("look").includes("pointerTarget(videoAt(pointer.x, pointer.y), video, menuOpen)"), "look: kept on its video while its menu is open");
+  // #1582: where the page is asked what lies under a spot the button would take (onControl).
+  // Bilibili's player keeps a feedback button (54 x 24) at its top right, 12 px from its edge, in
+  // view while the pointer moves over the player: on a 1550 px wide player the button's default
+  // spot (155 x 32, 8 px in) covers its glyph, yet the spot's middle and four corners all miss
+  // it. Every point the page is asked at lies inside the spot, and any control of 14 x 14 px or
+  // more under any part of it lies under one of them.
+  const probes = make(["probes"], "probes");
+  const inside = (p, r) => p[0] >= r.left && p[0] <= r.right && p[1] >= r.top && p[1] <= r.bottom;
+  const hits = (pts, r) => pts.some((p) => inside(p, r));
+  const spotAt = { left: 1387, top: 8, right: 1542, bottom: 40 };
+  const feedback = { left: 1484, top: 18, right: 1538, bottom: 42 };
+  const fivePoints = [[1464.5, 24], [1391, 12], [1538, 12], [1391, 36], [1538, 36]];
+  assert.ok(!fivePoints.some((p) => p[0] > feedback.left && p[0] < feedback.right && p[1] > feedback.top && p[1] < feedback.bottom), "the middle and corners alone miss Bilibili's feedback button (the miss #1582 saw)");
+  assert.ok(hits(probes(spotAt), feedback), "the points find Bilibili's feedback button under the button's end");
+  for (const box of [spotAt, { left: 8, top: 8, right: 44, bottom: 40 }, { left: 100, top: 300, right: 399, bottom: 334 }, { left: 5, top: 5, right: 5, bottom: 5 }]) {
+    const pts = probes(box);
+    assert.ok(pts.length >= 6 && pts.length <= 3 * 33, `a bounded number of points (${pts.length})`);
+    assert.ok(pts.every((p) => Number.isFinite(p[0]) && Number.isFinite(p[1]) && inside(p, box)), "every point inside the spot");
+    for (let x = box.left - 13; x <= box.right; x += 1) {
+      for (let y = box.top - 13; y <= box.bottom; y += 1) {
+        const c = { left: x, top: y, right: x + 14, bottom: y + 14 };
+        // Overlapping the spot by 14 px both ways (a smaller box can't fit inside it): found.
+        const over = Math.min(c.right, box.right) - Math.max(c.left, box.left) >= 14 && Math.min(c.bottom, box.bottom) - Math.max(c.top, box.top) >= 14;
+        if (over) assert.ok(hits(pts, c), `a 14 px control at ${x},${y} under the spot ${JSON.stringify(box)}`);
+      }
+    }
+  }
+  assert.ok(fn("onControl").includes("for (const [x, y] of probes(b))"), "onControl asks at every point of probes");
   // #1271: where the background asks the page's player what the click's video is (the window's
   // message): its middle while it has a box on the screen; a hover preview the page stopped as
   // the pointer went to the button (taken out, or hidden in a container of no size) is at the
@@ -3164,7 +3306,7 @@ function videoButton({ stored = {}, location, iframes, videos, subframe = false 
   assert.ok(/const IDLE_MS = 1500;/.test(source), "fades 1.5 s after the pointer rests");
   // Its texts: English's, kept as the fallback too.
   const english = JSON.parse(readText("../../extension/_locales/en/messages.json"));
-  for (const key of ["video_looking", "video_all_qualities", "video_no_choices", "video_playlist", "video_no_ytdlp", "video_too_long", "video_busy", "video_queued", "video_failed_lookup",
+  for (const key of ["video_looking", "video_all_qualities", "video_part", "video_no_choices", "video_playlist", "video_no_ytdlp", "video_too_long", "video_busy", "video_queued", "video_failed_lookup",
     "video_off", "video_drm", "video_cant_save", "video_open_post", "video_open_post_button", "video_drag_dots", "video_tip_best", "video_sending", "video_added", "video_show",
     "video_no_answer", "video_get_mdm", "video_retry", "video_turn_on", "video_download_best", "video_best", "video_original", "video_compatible"]) {
     assert.ok(english[key], key);
@@ -3246,22 +3388,184 @@ function videoButton({ stored = {}, location, iframes, videos, subframe = false 
     assert.equal(w.fitsWords(640, 240, 14), true);
     assert.equal(w.fitsWords(359, 100, 14), false, "under 360 px: the round button only");
     assert.equal(w.fitsWords(400, 380, 14), false, "a long language that wouldn't fit");
-    // #1278: Options → Download panels → Button size. Full (the default): the words where they
-    // fit, the round button on a small video or for a long language; Compact: round on every video.
+    // #1278: Options → Download panels → Button size. Full: the words where they fit, the round
+    // button on a small video or for a long language; Compact: round on every video; Automatic
+    // (the default, feedback 2026-11-23): the words on a big player only, round in a feed and on a
+    // small player.
     const english = 240;
     const german = 380; // the same button's width with longer words
-    assert.equal(w.compactFor(false, 1280, english, 14), false, "Full on a large video: the words");
-    assert.equal(w.compactFor(false, 1280, german, 14), false, "Full, a long language on a large video: the words");
-    assert.equal(w.compactFor(false, 320, english, 14), true, "Full on a small video: round");
-    assert.equal(w.compactFor(false, 400, german, 14), true, "Full, a long language that wouldn't fit: round");
+    assert.equal(w.compactFor("full", 1280, 720, english, 14, false), false, "Full on a large video: the words");
+    assert.equal(w.compactFor("full", 1280, 720, german, 14, false), false, "Full, a long language on a large video: the words");
+    assert.equal(w.compactFor("full", 320, 180, english, 14, false), true, "Full on a small video: round");
+    assert.equal(w.compactFor("full", 400, 225, german, 14, false), true, "Full, a long language that wouldn't fit: round");
+    assert.equal(w.compactFor("full", 680, 680, english, 14, true), false, "Full in a feed: the words, as before Automatic");
     for (const [width, full] of [[1920, english], [1280, german], [640, english], [400, german], [200, english]]) {
-      assert.equal(w.compactFor(true, width, full, 14), true, `Compact: round at ${width} px whatever the language`);
+      assert.equal(w.compactFor("compact", width, 720, full, 14, false), true, `Compact: round at ${width} px whatever the language`);
     }
-    assert.equal(w.compactFor(undefined, 1280, english, 14), false, "not said (an older app): Full");
-    // The answer to `panel` sets it, and position() decides from it.
-    const ask = fn("ask");
-    assert.ok(ask.includes("compactAlways = Boolean(r && r.compact);"), "ask: the size comes with the app's answer");
-    assert.ok(fn("position").includes('pill.classList.toggle("compact", compactFor(compactAlways, vr.width, fullWidth, INSET));'), "position: compact from the setting and the video's width");
+    assert.equal(w.compactFor("auto", 1280, 720, english, 14, false), false, "Automatic, a watch page's big player: the words");
+    assert.equal(w.compactFor("auto", 854, 480, german, 14, false), false, "Automatic, a big player in a long language: the words");
+    assert.equal(w.compactFor("auto", 680, 680, english, 14, true), true, "Automatic, a post's video in a feed: round, however big");
+    assert.equal(w.compactFor("auto", 560, 315, english, 14, false), true, "Automatic, a small player: round");
+    assert.equal(w.compactFor("auto", 900, 260, english, 14, false), true, "Automatic, a short wide strip: round");
+    // The app's answer: Compact, Full (newer apps say it), else Automatic, which an older app's
+    // compact: false is (its Full was the default, never chosen).
+    const sizeMode = make(["sizeMode"], "sizeMode");
+    assert.deepEqual([{ on: true, compact: true }, { on: true, compact: false, full: true }, { on: true, compact: false }, { on: true }, null, { compact: "yes", full: 1 }].map(sizeMode),
+      ["compact", "full", "auto", "auto", "auto", "auto"]);
+    // The answer to `panel` sets it, and position() decides from it, the video's size and its feed.
+    assert.ok(fn("ask").includes("size = sizeMode(r);"), "ask: the size comes with the app's answer");
+    assert.ok(fn("position").includes('pill.classList.toggle("compact", compactFor(size, vr.width, vr.height, fullWidth, INSET, isFeed(video)));'), "position: compact from the setting, the video's size and its feed");
+  }
+  // The button fades instead of vanishing (feedback 2026-11-23): full while the pointer moves over
+  // the video, faint 1.5 s after it rests or 0.4 s after it left (on its way to a button outside
+  // the player, #1735), gone 3 s later; full whenever it is wanted (the pointer on it, its menu, a
+  // drag, the keyboard).
+  {
+    const fadeState = make(["fadeState"], "fadeState");
+    const f = (held, over, sinceMove, sinceOver) => fadeState(held, over, sinceMove, sinceOver, 1500, 400, 3000);
+    assert.equal(f(false, true, 0, 0), "full", "the pointer moving over the video");
+    assert.equal(f(false, true, 1499, 0), "full");
+    assert.equal(f(false, true, 1500, 0), "faint", "rested 1.5 s: faint");
+    assert.equal(f(false, true, 4499, 0), "faint");
+    assert.equal(f(false, true, 4500, 0), "gone", "and gone 3 s after");
+    assert.equal(f(false, false, 0, 399), "full", "just left (towards a button outside the player): still whole");
+    assert.equal(f(false, false, 0, 400), "faint", "left: faint");
+    assert.equal(f(false, false, 0, 3400), "gone", "and gone");
+    for (const [move, over] of [[99999, 99999], [0, 99999], [99999, 0]]) assert.equal(f(true, false, move, over), "full", "wanted: whole");
+    assert.ok(/const IDLE_MS = 1500;\s*const LEAVE_MS = 400;\s*const FAINT_MS = 3000;/.test(source), "its times");
+    const tick = fn("tick");
+    assert.ok(tick.includes("const wanted = onButton || menuOpen || Boolean(dragging) || keyboardOn();"), "tick: wanted while on it, its menu, a drag, the keyboard");
+    assert.ok(/if \(!over && !wanted && lookingFor\) \{\s*clearTimeout\(lookTimer\);\s*lookingFor = null;/.test(tick), "tick: off the video, the early look-up waits no more (#1053's pass asks nothing)");
+    assert.ok(tick.includes('if (fade === "gone") return hide();') && tick.includes('pill.classList.toggle("faint", fade === "faint");'), "tick: faint, then gone");
+    assert.ok(fn("show").includes('pill.classList.remove("faint");'), "show: whole again as the pointer moves over the video");
+    // Reached as it fades out: whole again (a click there would open its menu in a button about
+    // to go).
+    assert.ok(/root\.addEventListener\("pointerenter", \(\) => \{[^}]*if \(video && !pill\.classList\.contains\("shown"\)\) show\(video\);/.test(source), "reached while fading out: shown again");
+    // A show right after a hide (the pointer's move landing just after a fullscreen change hid it)
+    // isn't taken away by the hide's delayed display: none.
+    assert.ok(fn("show").includes("clearTimeout(hideTimer);") && fn("hide").includes("hideTimer = setTimeout("), "show cancels a hide's pending display: none");
+    assert.ok(/\.pill\.shown\.faint \{ opacity: \.3;/.test(source) && /\.pill\.shown\.faint:hover, \.pill\.shown\.faint:focus-within \{ opacity: 1;/.test(source), "faint: whole again under the pointer and the keyboard at once");
+    assert.ok(/@media \(prefers-reduced-motion: reduce\) \{\s*\.pill \{ transition: none;/.test(source), "reduced motion: no fade's motion");
+    ok("video.js: the button fades to faint, then goes; whole while wanted (#1735's feedback)");
+  }
+  // Where it sits (#1735): a spot on the video's edge, or outside the player next to it; snapped to
+  // the edge's corners and middle; remembered per site; mirrored for right to left.
+  {
+    const w = make(["edgeOf", "snap", "spotAt", "dragAt"], "{ edgeOf, snap, spotAt, dragAt }");
+    const r = { left: 100, top: 200, right: 740, bottom: 560, width: 640, height: 360 };
+    const view = { width: 1280, height: 800 };
+    const plain = (x) => JSON.parse(JSON.stringify(x));
+    // Over the player: the corners, inset 8 px.
+    assert.deepEqual(plain(w.spotAt(r, 40, 30, { x: 1, y: 0 }, 8, 6, view)), { left: 692, top: 208, out: false }, "top right");
+    assert.deepEqual(plain(w.spotAt(r, 40, 30, { x: 0, y: 1 }, 8, 6, view)), { left: 108, top: 522, out: false }, "bottom left");
+    // Outside it, 6 px from its side, along it.
+    assert.deepEqual(plain(w.spotAt(r, 40, 30, { x: 1, y: 0, out: true, side: "top" }, 8, 6, view)), { left: 700, top: 164, out: true }, "above its top right");
+    assert.deepEqual(plain(w.spotAt(r, 40, 30, { x: 0, y: 1, out: true, side: "bottom" }, 8, 6, view)), { left: 100, top: 566, out: true }, "under its bottom left");
+    assert.deepEqual(plain(w.spotAt(r, 40, 30, { x: 1, y: 0, out: true, side: "right" }, 8, 6, view)), { left: 746, top: 200, out: true }, "beside its right, at the top");
+    assert.deepEqual(plain(w.spotAt(r, 40, 30, { x: 0, y: 0.5, out: true, side: "left" }, 8, 6, view)), { left: 54, top: 365, out: true }, "beside its left, halfway");
+    // Where outside doesn't fit (a player at the window's top, as wide as it, in full screen): over
+    // it, on that edge.
+    const top = { left: 0, top: 0, right: 1280, bottom: 720, width: 1280, height: 720 };
+    assert.deepEqual(plain(w.spotAt(top, 40, 30, { x: 1, y: 0, out: true, side: "top" }, 8, 6, view)), { left: 1232, top: 8, out: false }, "no room above: inside, at the top");
+    assert.deepEqual(plain(w.spotAt(top, 40, 30, { x: 1, y: 0.5, out: true, side: "right" }, 8, 6, view)), { left: 1232, top: 345, out: false }, "no room beside: inside, on the right");
+    // A drag: over the player while the button's middle is; past an edge, outside on that side.
+    assert.deepEqual(plain(w.dragAt(r, 40, 30, 400, 300, 8)), { x: 292 / 584, y: 92 / 314 }, "free over the player");
+    assert.deepEqual(plain(w.dragAt(r, 40, 30, 700, 160, 8)), { x: 1, y: 0, out: true, side: "top" }, "above the top right");
+    assert.deepEqual(plain(w.dragAt(r, 40, 30, 760, 365, 8)), { x: 1, y: 0.5, out: true, side: "right" }, "beside the right");
+    assert.deepEqual(plain(w.dragAt(r, 40, 30, 90, 580, 8)), { x: 0, y: 1, out: true, side: "bottom" }, "under the bottom left");
+    assert.deepEqual(plain(w.dragAt(r, 40, 30, 50, 300, 8)), { x: 0, y: 100 / 330, out: true, side: "left" }, "beside the left");
+    assert.equal(w.dragAt(r, 40, 30, 700, 190, 8).out, undefined, "half out (its middle still over the player): over it");
+    assert.deepEqual(plain(w.dragAt(r, 200, 30, 650, 160, 8)), { x: 1, y: 0, out: true, side: "top" }, "a wide button above the top right corner: above it, though its middle is further right");
+    // Dropped: snapped to its edge's corners and middle, along the side outside it.
+    assert.deepEqual(plain(w.snap({ x: 0.97, y: 0.03 })), { x: 1, y: 0 }, "into the corner");
+    assert.deepEqual(plain(w.snap({ x: 0.52, y: 0.9 })), { x: 0.5, y: 1 }, "the bottom's middle");
+    assert.deepEqual(plain(w.snap({ x: 0.3, y: 0.02 })), { x: 0.3, y: 0 }, "along the top");
+    assert.deepEqual(plain(w.snap({ x: 0.95, y: 0, out: true, side: "top" })), { x: 1, y: 0, out: true, side: "top" }, "outside, into its corner");
+    assert.deepEqual(plain(w.snap({ x: 1, y: 0.47, out: true, side: "right" })), { x: 1, y: 0.5, out: true, side: "right" }, "outside, the side's middle");
+    // What the site kept, whatever it is: a spot on an edge (an older copy's kept spot as it was).
+    assert.deepEqual(plain(w.snap({ x: 1, y: 0 })), { x: 1, y: 0 });
+    assert.deepEqual(plain(w.snap({ x: "a", y: null, out: "yes", side: "middle" })), { x: 0, y: 0 }, "nonsense: a corner, over the player");
+    assert.deepEqual(plain(w.snap({ x: 7, y: -3, out: true, side: "bottom" })), { x: 1, y: 1, out: true, side: "bottom" }, "out of range: clamped");
+    assert.deepEqual(plain(w.snap({ x: 0.5, y: 0.5, out: true, side: "left" })), { x: 0, y: 0.5, out: true, side: "left" });
+    assert.equal(w.edgeOf({ x: 1, y: 0, out: true, side: "top" }), "top", "outside: its side, not the nearest edge");
+    assert.equal(w.edgeOf({ x: 0.5, y: 0.02 }), "top");
+    // Wired: the drag, the guide, kept per site (not in a private window), its corner mirrored.
+    assert.ok(source.includes("dragging.at = dragAt(r, w, h, e.clientX - dragging.dx, e.clientY - dragging.dy, INSET);"), "the drag: inside or out");
+    assert.ok(fn("position").includes("const p = spotAt(r, w, h, at, INSET, GAP, view());"), "position: inside or out, where it fits");
+    assert.ok(fn("remember").includes("if (PRIVATE) return;"), "remember: never in a private window");
+    assert.ok(/remember\("positions", place\);/.test(source), "a drag's spot kept for the site");
+    assert.ok(source.includes("const HOME = { x: rtl ? 0 : 1, y: 0 };"), "its corner: the top's end (the top left right to left)");
+    assert.ok(source.includes("const CORNERS = rtl ? [{ x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }] : [{ x: 0, y: 0 }, { x: 0, y: 1 }, { x: 1, y: 1 }];"), "the other corners mirrored too");
+    assert.ok(fn("look").includes('if (video && root.matches(":hover")) return;'), "on the button (outside its player, over the next post): it stays with its video");
+    assert.ok(fn("openMenu").includes('item("home").hidden = !chosen;'), "Put the button back in its corner: once it was moved");
+    ok("video.js: the button moves to a corner or outside the player, snapped, kept per site (#1735)");
+  }
+  // #1735: the menu's filters. What it lists (both kinds, the sound only), its file types and
+  // codecs where they differ; a filter kept from another video never empties the list.
+  {
+    const w = make(["cleanFilter", "typeOf", "codecOf", "filterOptions", "filterChoices"], "{ cleanFilter, filterOptions, filterChoices }");
+    const yt = [
+      { label: "2160p MP4 · AV1", ext: "mp4", height: 2160, codec: "AV1" },
+      { label: "2160p MP4 · VP9", ext: "mp4", height: 2160, codec: "VP9" },
+      { label: "Most compatible (H.264 + AAC) · 1080p", ext: "mp4", height: 1080, codec: "H.264", compatible: true },
+      { label: "1080p MP4 · AV1", ext: "mp4", height: 1080, codec: "AV1" },
+      { label: "Audio only original M4A", ext: "m4a", audio: true, original: true },
+      { label: "Audio only original WEBM", ext: "webm", audio: true, original: true },
+      { label: "Audio only MP3 VBR", ext: "mp3", audio: true },
+    ];
+    const plain = (x) => JSON.parse(JSON.stringify(x));
+    assert.deepEqual(plain(w.filterOptions(yt, "all")), { kinds: ["all", "video", "audio"], types: ["MP4", "M4A", "WEBM", "MP3"], codecs: [] }, "both kinds: no codecs beside the sound");
+    assert.deepEqual(plain(w.filterOptions(yt, "video")), { kinds: ["all", "video", "audio"], types: [], codecs: ["AV1", "VP9", "H.264"] }, "pictures, every one an MP4: codecs only");
+    assert.deepEqual(plain(w.filterOptions(yt, "audio")), { kinds: ["all", "video", "audio"], types: ["M4A", "WEBM", "MP3"], codecs: [] });
+    assert.deepEqual(plain(w.filterOptions(yt.slice(0, 2), "audio")), { kinds: [], types: [], codecs: ["AV1", "VP9"] }, "one kind: no kinds, a filter kept for another kind is any");
+    assert.deepEqual(plain(w.filterOptions([{ label: "720p MP4" }, { label: "360p MP4" }], "all")), { kinds: [], types: [], codecs: [] }, "an older app's: nothing to filter");
+    assert.deepEqual(plain(w.filterChoices(yt, { kind: "all" }).keep), [0, 1, 2, 3, 4, 5, 6], "no filter: everything, in the app's order");
+    assert.deepEqual(plain(w.filterChoices(yt, { kind: "audio" }).keep), [4, 5, 6]);
+    assert.deepEqual(plain(w.filterChoices(yt, { kind: "audio", type: "mp3" }).keep), [6], "a type as kept, in any case");
+    assert.deepEqual(plain(w.filterChoices(yt, { kind: "video", codec: "AV1" }).keep), [0, 3], "the places in the app's list (what a pick sends)");
+    assert.deepEqual(plain(w.filterChoices(yt, { kind: "video", codec: "HEVC" }).keep), [0, 1, 2, 3], "a codec this video hasn't: any");
+    assert.deepEqual(plain(w.filterChoices(yt, { kind: "all", codec: "AV1" }).keep), [0, 1, 2, 3, 4, 5, 6], "a codec beside the sound: any");
+    assert.deepEqual(plain(w.filterChoices(yt.slice(0, 4), { kind: "audio" }).keep), [0, 1, 2, 3], "the sound kept for a video that has none: everything");
+    const f = w.filterChoices(yt, { kind: "video", codec: "VP9" });
+    assert.deepEqual([f.kind, f.type, f.codec], ["video", "", "VP9"], "the filter as it applies");
+    // What a page or an older copy kept is checked: words only, short.
+    assert.deepEqual(plain(w.cleanFilter({ kind: "<b>", type: "x".repeat(11), codec: "<img>" })), { kind: "all", type: "", codec: "" });
+    assert.deepEqual(plain(w.cleanFilter(null)), { kind: "all", type: "", codec: "" });
+    assert.deepEqual(plain(w.cleanFilter({ kind: "audio", type: "webm", codec: "H.264" })), { kind: "audio", type: "WEBM", codec: "H.264" });
+    // The menu: its chips as text, the rows it keeps, "Download best" the best of those; kept per
+    // site, forgotten when it lists everything again; chips are the keyboard's too.
+    const fill = fn("fillMenu");
+    assert.ok(fill.includes("const kept = filterChoices(choices, filter);") && fill.includes("const shown = groups[kind].filter((i) => keep.has(i));"), "fillMenu: the filter's rows");
+    assert.ok(fill.includes("const top = bestOf({ state: \"ready\", choices: kept.keep.map((i) => choices[i]) }) || best;"), "Download best: the best the filter keeps");
+    assert.ok(fn("fillFilters").includes("b.textContent = words;") && !fn("fillFilters").includes("innerHTML"), "chips: text only");
+    assert.ok(fn("setFilter").includes('remember("videoFilters", all ? null : filter);'), "kept per site");
+    assert.ok(fn("runItem").includes('if (b.dataset.filter !== undefined) return setFilter(b.dataset.filter, b.dataset.value || "");'), "a chip, clicked or by key");
+    ok("video.js: the menu's filters (#1735)");
+  }
+  // Which videos are a feed's (the Automatic size's round button there): the big sites' feeds and
+  // home pages, YouTube's home; not a video's own page, an embedded player, a watch page.
+  {
+    const source = readText("../../extension/video.js");
+    const start = source.indexOf("function videoPage(v) {");
+    const end = source.indexOf("// ---- the video's own address: end.");
+    const body = `${source.slice(start, end)}; return feedVideo;`;
+    const feedOf = (href, { feed = false, videos = 1 } = {}) => {
+      const v = { parentElement: null, parentNode: null, getAttribute: () => null };
+      if (feed) v.parentElement = { parentElement: null, parentNode: null, getAttribute: (a) => (a === "role" ? "feed" : null) };
+      const document = { querySelectorAll: (sel) => (sel === "video" ? { length: videos } : []), querySelector: () => null };
+      return new Function("location", "document", body)({ href }, document)(v);
+    };
+    for (const page of ["https://www.facebook.com/", "https://www.facebook.com/watch/", "https://x.com/home", "https://www.linkedin.com/feed/", "https://www.instagram.com/", "https://www.reddit.com/", "https://www.reddit.com/r/videos/", "https://www.youtube.com/", "https://www.youtube.com/@channel/videos", "https://www.tiktok.com/foryou"]) {
+      assert.equal(feedOf(page), true, `a feed: ${page}`);
+    }
+    for (const page of ["https://www.youtube.com/watch?v=abc", "https://www.youtube.com/shorts/abc", "https://www.facebook.com/watch/?v=1234567", "https://www.facebook.com/reel/1234567", "https://x.com/someone/status/123", "https://www.reddit.com/r/videos/comments/abc/title/", "https://www.instagram.com/p/AbCdEf1/", "https://vimeo.com/123456", "https://www.youtube-nocookie.com/embed/abc"]) {
+      assert.equal(feedOf(page), false, `a video's own page: ${page}`);
+    }
+    assert.equal(feedOf("https://social.example/@me", { feed: true }), true, "any site's role=\"feed\"");
+    assert.equal(feedOf("https://news.example/", { videos: 3 }), true, "a home page of many videos");
+    assert.equal(feedOf("https://news.example/", { videos: 1 }), false, "a home page's one video");
+    assert.equal(feedOf("https://news.example/article/1", { videos: 3 }), false, "an article's players");
+    ok("video.js: a feed's videos get the round button by default (feedback 2026-11-23)");
   }
   ok("video.js: the qualities' menu follows a lookup one question at a time for a minute; rows as text, the user's own clicks and keys; its words, #703's early look-up, #741's moves");
 }
@@ -3299,6 +3603,14 @@ function videoButton({ stored = {}, location, iframes, videos, subframe = false 
     const text = readText(`../../extension/${file}`);
     for (const [, key] of text.matchAll(/(?:t\(|data-i18n=)"((?:menu|status|popup|video)_\w+)"/g)) assert.ok(english[key], `${file}: ${key}`);
   }
+  // The popup's (#1496): every key named in them, however it is passed on, and those its row
+  // buttons make by adding "_named".
+  for (const file of ["popup.html", "popup.js", "popup-ui.js", "popup-downloads.js"]) {
+    const text = readText(`../../extension/${file}`);
+    for (const [, key] of text.matchAll(/"((?:popup|status)_[a-z0-9_]+)"/g)) assert.ok(english[key], `${file}: ${key}`);
+    for (const [, key] of text.matchAll(/data-i18n(?:-label|-placeholder)?="(\w+)"/g)) assert.ok(english[key], `${file}: ${key}`);
+  }
+  for (const b of ["popup_act_folder", "popup_act_pause", "popup_act_resume", "popup_act_more"]) assert.ok(english[`${b}_named`], `${b}_named`);
   for (const why of ["not_installed", "forbidden", "not_running", "host_failed", "too_large", "update_app"]) {
     assert.ok(english[`status_${why}`], `status_${why}`);
   }
@@ -4025,7 +4337,8 @@ const ask = (listeners) => (m, sender) => new Promise((r) => listeners.message(m
 // says it as the button goes down (pointerdown) and again at the click; the download may come
 // before the click's word, under the link's address, its redirect's end, or another address a
 // page's script went to. Each is the browser's; one click leaves one such download to it, for ten
-// seconds.
+// seconds; the link's own address, and a download its own page starts, for a minute (#1494: a
+// bot check's page runs its script first).
 {
   const clock = { t: Date.now() };
   class FakeDate extends Date {
@@ -4064,10 +4377,30 @@ const ask = (listeners) => (m, sender) => new Promise((r) => listeners.message(m
     calls.length = 0;
     await send({ type: "bypass", url: "https://site.test/dl/10" }, page);
     assert.ok(!(await kept({ id: 64, url: "https://other.test/e.zip", referrer: "https://other.test/page", filename: "e.zip" })), "another site's");
-    // Ten seconds on, the click is forgotten: its link goes to MDM again.
+    // Ten seconds on, a download from the page the link was on is MDM's again; the link's own
+    // address stays the browser's for a minute (#1494), then it is forgotten too.
     clock.t += 10001;
-    assert.ok(!(await kept({ id: 65, url: "https://site.test/dl/10", referrer: "https://site.test/files", filename: "f.zip" })), "forgotten");
-    assert.equal(natives(calls).length, 2);
+    assert.ok(!(await kept({ id: 65, url: "https://files.test/token/f.zip", referrer: "https://site.test/files", filename: "f.zip" })), "the page's, later");
+    assert.ok(await kept({ id: 66, url: "https://site.test/dl/10", referrer: "https://site.test/files", filename: "g.zip" }), "the link itself, later");
+    clock.t += 50000;
+    assert.ok(!(await kept({ id: 67, url: "https://site.test/dl/10", referrer: "https://site.test/files", filename: "h.zip" })), "forgotten");
+    assert.equal(natives(calls).length, 3);
+    // #1494: a link to a page behind a bot check ("Just a moment..."). page.js followed it: its
+    // page opened in the tab, its script ran (half a minute, a box ticked) and loaded the address
+    // again, which is the file now: the browser's. Or the check sent to the file elsewhere, from
+    // its page (its referrer: the link's address with the check's token added): the browser's,
+    // once. A download from the page the link was on that late is MDM's.
+    calls.length = 0;
+    await send({ type: "bypass", url: "https://site.test/get?id=8" }, page);
+    clock.t += 30000;
+    assert.ok(await kept({ id: 68, url: "https://site.test/get?id=8", referrer: "https://site.test/files", filename: "i.zip" }), "the link, after its check");
+    await send({ type: "bypass", url: "https://site.test/get?id=9" }, page);
+    clock.t += 30000;
+    assert.ok(!(await kept({ id: 69, url: "https://files.test/j.zip", referrer: "https://site.test/files", filename: "j.zip" })), "the page the link was on, half a minute on");
+    assert.ok(!(await kept({ id: 70, url: "https://files.test/k.zip", referrer: "https://site.test/get?id=10&__cf_chl_rt_tk=abc", filename: "k.zip" })), "another link's page");
+    assert.ok(await kept({ id: 71, url: "https://files.test/l.zip", referrer: "https://site.test/get?id=9&__cf_chl_rt_tk=abc", filename: "l.zip" }), "the link's page, after its check");
+    assert.ok(!(await kept({ id: 72, url: "https://files.test/m.zip", referrer: "https://site.test/get?id=9&__cf_chl_rt_tk=abc", filename: "m.zip" })), "once");
+    assert.equal(natives(calls).length, 3);
   }
   // Firefox (on a Mac too): page.js follows the link once the background has it (the browser
   // alone does nothing with an Alt+click); the page load's answer is the download. Straight, by a
@@ -4410,6 +4743,129 @@ ok("#1345 Chromium: Telegram Web's service-worker downloads stay in the browser"
 
   ok("another MDM: multiple servers, migration, switching, forget, and 401 pruning");
 }
+// Another MDM chosen (#157): only a download becomes one there (its api/add), each once; every
+// other message is this computer's MDM's or nobody's, and no remote call. The video button's
+// "may it show here" went to api/add too: pointing at videos added the page to the other MDM's
+// list every few seconds. With and without an MDM on this computer to ask.
+for (const here of [true, false]) {
+  const clock = { t: Date.now() };
+  class FakeDate extends Date {
+    static now() {
+      return clock.t;
+    }
+  }
+  const film = "https://tube.test/watch?v=1";
+  const tab = { id: 5, index: 2, url: film, title: "A film - Tube", incognito: false };
+  const { api, calls, listeners, store } = fakeApi({ firefox: false, host: here, tabs: { 5: tab } });
+  load(api, false, { Date: FakeDate });
+  await settle();
+  const R = "https://server.test:8463/";
+  store.remotes = [{ url: R, token: "k" }];
+  store.remote = { url: R, token: "k" };
+  served = {
+    [`${R}api/add`]: { status: 200, body: JSON.stringify({ ok: true }) },
+    [`${R}api/act`]: { status: 200, body: JSON.stringify({ done: [4] }) },
+  };
+  // What reached the other MDM since `from`: [path, what was sent].
+  const remoteCalls = (from) =>
+    fetched.slice(from).filter(([u]) => u.startsWith(R)).map(([u]) => {
+      const path = u.slice(R.length);
+      const opts = ((served[u] && served[u].calls) || []).shift();
+      const body = opts ? JSON.parse(opts.body) : null;
+      return [path, path === "api/add" ? body.url : body];
+    });
+  const page = { id: "ours", frameId: 0, url: film, tab };
+  const popup = { id: "ours", url: "chrome-extension://ours/popup.html" };
+  const send = (m, sender) => new Promise((r) => listeners.message(m, sender, (v) => r(JSON.parse(JSON.stringify(v ?? null)))));
+  const table = [
+    // The video button: its question, its menu's look-ups, its other buttons; none a download.
+    ["panel", () => send({ type: "panel" }, page), []],
+    ["video-lookup", () => send({ type: "video-lookup", src: "https://cdn.test/v/clip.mp4", url: film }, page), []],
+    ["video-poll", () => send({ type: "video-poll", token: "t1" }, page), []],
+    ["video-pick", () => send({ type: "video-pick", token: "t1", choice: 0 }, page), []],
+    ["video-played", () => send({ type: "video-played", played: { duration: 60 } }, page), []],
+    ["show-download", () => send({ type: "show-download", address: "https://cdn.test/v/clip.mp4" }, page), []],
+    ["show-site", () => send({ type: "show-site" }, page), []],
+    ["options", () => send({ type: "options" }, page), []],
+    ["get-mdm", () => send({ type: "get-mdm" }, page), []],
+    ["open-post", () => send({ type: "open-post", url: "https://tube.test/p/1" }, page), []],
+    ["rules", () => send({ type: "rules" }, page), []],
+    ["bypass", () => send({ type: "bypass", url: "https://x.test/a.zip" }, page), []],
+    ["drive-frame-pointer", () => send({ type: "drive-frame-pointer" }, page), []],
+    // The popup's: its state, its switches, its media list; a download's button goes to the
+    // other MDM's own api/act.
+    ["state", () => send({ type: "state" }, popup), []],
+    ["pause", () => send({ type: "pause", paused: false }, popup), []],
+    ["exclude-site", () => send({ type: "exclude-site", host: "tube.test" }, popup), []],
+    ["include-site", () => send({ type: "include-site", host: "tube.test" }, popup), []],
+    ["site-excluded", () => send({ type: "site-excluded", host: "tube.test" }, popup), []],
+    ["open-app", () => send({ type: "open-app" }, popup), []],
+    ["open-options", () => send({ type: "open-options" }, popup), []],
+    ["media", () => send({ type: "media", tab: 5 }, popup), []],
+    ["download-act", () => send({ type: "download-act", act: "pause", id: 4 }, popup), [["api/act", { action: "pause", ids: [4] }]]],
+    // Downloads: the button's click (Download video), the browser's own download, the right-click
+    // menu's link, its player and a stream's manifest. Each one api/add, of its address.
+    ["video", () => send({ type: "video", src: "https://cdn.test/v/clip.mp4", url: film, title: "A film" }, page), [["api/add", film]]],
+    ["download", () => (listeners.determining({ id: 91, url: "https://dl.test/f.zip", filename: "f.zip" }, () => {}), settle()), [["api/add", "https://dl.test/f.zip"]]],
+    ["menu link", () => listeners.menu({ menuItemId: "mdm-link", linkUrl: "https://dl.test/g.zip", pageUrl: film }, tab), [["api/add", "https://dl.test/g.zip"]]],
+    ["menu player", () => listeners.menu({ menuItemId: "mdm-link", mediaType: "video", srcUrl: "blob:https://tube.test/1", frameId: 0, pageUrl: film }, tab), [["api/add", film]]],
+    ["menu stream", () => listeners.menu({ menuItemId: "mdm-link", linkUrl: "https://cdn.test/s/a.m3u8", pageUrl: film }, tab), [["api/add", film]]],
+  ];
+  for (const [kind, act, want] of table) {
+    const from = fetched.length;
+    await act();
+    await settle();
+    assert.deepEqual(remoteCalls(from), want, `${kind}, ${here ? "an MDM here too" : "no MDM here"}`);
+  }
+  // Regression: pointing at videos for a while (the page asks again every few seconds, each
+  // answer kept PANEL_KEEP_MS) never adds anything to the other MDM; the button shows, as this
+  // computer's Options say, or as they are at first when there's no MDM here to ask.
+  clock.t += 6000;
+  const from = fetched.length;
+  const asked = natives(calls).filter((m) => m.panel).length;
+  for (let i = 0; i < 5; i++) {
+    assert.deepEqual(await send({ type: "panel" }, page), { on: true, compact: false });
+    clock.t += 6000;
+  }
+  assert.deepEqual(remoteCalls(from), [], "the panel question never reaches the other MDM");
+  assert.equal(natives(calls).filter((m) => m.panel).length - asked, here ? 5 : 0, "asked of this computer's MDM, when there is one");
+  // A site this computer's Options keep the button off: off with another MDM chosen too.
+  if (here) {
+    const off = fakeApi({ firefox: false, panelOn: false });
+    load(off.api, false);
+    await settle();
+    Object.assign(off.store, { remotes: [{ url: R, token: "k" }], remote: { url: R, token: "k" } });
+    assert.deepEqual(await new Promise((r) => off.listeners.message({ type: "panel" }, page, (v) => r(JSON.parse(JSON.stringify(v))))), { on: false, compact: false });
+  }
+  // Only the kinds a download is may become one there, and nothing else calls the remote's
+  // api/add.
+  assert.ok(/const REMOTE_ADD = new Set\(\["file", "video"\]\);/.test(code), "the whitelist");
+  assert.equal((code.match(/"api\/add"/g) || []).length, 1, "api/add sent from one place");
+  assert.equal((code.match(/remoteSend\(/g) || []).length, 2, "remoteSend called from `download` only");
+  ok(`another MDM: only downloads reach its api/add, the button's question never (${here ? "an MDM here too" : "no MDM here"})`);
+}
+// Back to this computer: the same downloads and questions as before, all to its MDM.
+{
+  const film = "https://tube.test/watch?v=1";
+  const tab = { id: 5, index: 2, url: film, title: "A film - Tube", incognito: false };
+  const { api, calls, listeners } = fakeApi({ firefox: false, tabs: { 5: tab } });
+  load(api, false);
+  await settle();
+  const from = fetched.length;
+  const page = { id: "ours", frameId: 0, url: film, tab };
+  const send = (m) => new Promise((r) => listeners.message(m, page, r));
+  await send({ type: "panel" });
+  await send({ type: "video", src: "https://cdn.test/v/clip.mp4", url: film, title: "A film" });
+  listeners.determining({ id: 92, url: "https://dl.test/f.zip", filename: "f.zip" }, () => {});
+  await settle();
+  const sent = natives(calls);
+  assert.deepEqual(
+    sent.map((m) => [m.panel ? "panel" : m.video ? "video" : "file", m.url]),
+    [["panel", film], ["video", film], ["file", "https://dl.test/f.zip"]],
+  );
+  assert.deepEqual(fetched.slice(from).filter(([u]) => /\/api\//.test(u)), [], "nothing to any remote control");
+  ok("this computer: the button's question, Download video and a download go to its MDM");
+}
 // Safari has no downloads API: the extension still starts, and a link page.js holds (a file type
 // Options lists) is offered to the app as a browser's download is; the app taking it is told to
 // page.js, which lets the click go on when it isn't.
@@ -4540,9 +4996,16 @@ ok("#1345 Chromium: Telegram Web's service-worker downloads stay in the browser"
   assert.ok(e.defaultPrevented);
   ({ e } = t.click("https://x.test/f/page.html"));
   assert.ok(!e.defaultPrevented, "not a listed type");
-  ({ e } = t.click("https://x.test/f/a.zip", { altKey: true }));
-  assert.ok(!e.defaultPrevented, "Alt: the browser's");
-  assert.deepEqual(t.sent.at(-1), { type: "bypass", url: "https://x.test/f/a.zip" });
+  // Alt (Option): never held; Safari's own Option+click (a save of the link) is stopped and the
+  // link followed as a plain click once the background has it, not held either (#1494).
+  const links = () => t.sent.filter((m) => m.type === "link").length;
+  const before = links();
+  ({ a, e } = t.click("https://x.test/f/a.zip", { altKey: true }));
+  assert.ok(e.defaultPrevented && a.clicks === 0, "Alt: the browser's, not held");
+  await t.settle();
+  assert.ok(a.clicks === 1 && !a.again.altKey, "Safari: followed as a plain click");
+  assert.equal(links(), before, "the click followed isn't held");
+  assert.ok(t.sent.slice(-2).every((m) => m.type === "bypass" && m.url === "https://x.test/f/a.zip"));
   ({ e } = t.click("https://x.test/dl?id=4", {}, { download: "b.iso" }));
   assert.ok(e.defaultPrevented, "a download attribute names the type");
   assert.deepEqual(t.sent.at(-1), { type: "link", url: "https://x.test/dl?id=4", name: "b.iso" }, "and is sent with it");
@@ -4563,36 +5026,43 @@ ok("#1345 Chromium: Telegram Web's service-worker downloads stay in the browser"
   assert.ok(!t.click("https://x.test/f/a.zip").e.defaultPrevented);
   t = await run({ safari: false, taken: true });
   assert.ok(!t.click("https://x.test/f/a.zip").e.defaultPrevented, "Chrome and Firefox take it from the downloads API");
-  // #332, Alt (Option on a Mac) on a link. Chromium (and Safari) download it themselves at the
-  // click: the press already said it, the click is left as it is.
-  ({ a, e } = t.click("https://x.test/f/a.zip", { altKey: true }));
-  await t.settle();
-  assert.ok(!e.defaultPrevented && a.clicks === 0);
-  assert.deepEqual(t.sent.slice(-2), [{ type: "bypass", url: "https://x.test/f/a.zip" }, { type: "bypass", url: "https://x.test/f/a.zip" }], "at the press, and the click");
-  // Firefox does nothing with it (or saves it, with browser.altClickSave): its own handling is
-  // stopped, and once the background has it the link is followed as a plain click (one click,
-  // not trusted, without Alt).
-  t = await run({ firefox: true, taken: true });
-  ({ a, e } = t.click("https://x.test/go?f=a", { altKey: true }));
-  assert.ok(e.defaultPrevented && a.clicks === 0, "not before the background has it");
-  await t.settle();
-  assert.ok(a.clicks === 1 && !a.again.altKey && a.again.isTrusted !== true, "followed");
-  assert.ok(t.sent.length >= 2 && t.sent.every((m) => m.type === "bypass" && m.url === "https://x.test/go?f=a"));
-  // A link the page's own script took, Alt with Shift or Cmd (Firefox's new window, new tab),
-  // the middle button: left as they are.
-  ({ a, e } = t.click("https://x.test/go?f=b", { altKey: true }, undefined, (ev) => ev.preventDefault()));
-  await t.settle();
-  assert.equal(a.clicks, 0, "the page's script");
-  for (const keys of [{ shiftKey: true }, { metaKey: true }, { ctrlKey: true }]) {
-    ({ a, e } = t.click("https://x.test/go?f=c", { altKey: true, ...keys }));
+  // #332, #1494: Alt (Option on a Mac) on a link, in every browser. Chromium would save the link
+  // without opening it at the click (a bot check's page, "Just a moment...", saved instead of
+  // run), Firefox does nothing with it (or saves it, with browser.altClickSave): the browser's
+  // own handling is stopped, and once the background has it the link is followed as a plain
+  // click (one click, not trusted, without Alt), so its page opens in the tab and its check runs.
+  for (const firefox of [false, true]) {
+    const who = firefox ? "Firefox" : "Chromium";
+    t = await run({ firefox, taken: true });
+    ({ a, e } = t.click("https://x.test/go?f=a", { altKey: true }));
+    assert.ok(e.defaultPrevented && a.clicks === 0, `${who}: not before the background has it`);
     await t.settle();
-    assert.ok(!e.defaultPrevented && a.clicks === 0, JSON.stringify(keys));
+    assert.ok(a.clicks === 1 && !a.again.altKey && a.again.isTrusted !== true, `${who}: followed`);
+    assert.deepEqual(t.sent.slice(0, 2), [{ type: "bypass", url: "https://x.test/go?f=a" }, { type: "bypass", url: "https://x.test/go?f=a" }], `${who}: at the press, and the click`);
+    assert.ok(t.sent.every((m) => m.type === "bypass" && m.url === "https://x.test/go?f=a"));
+    // A link with a `download` name: followed the same way (the browser then downloads it under
+    // that name, as a plain click does).
+    ({ a, e } = t.click("https://x.test/dl?id=5", { altKey: true }, { download: "c.iso" }));
+    await t.settle();
+    assert.ok(e.defaultPrevented && a.clicks === 1 && !a.again.altKey, `${who}: a download link`);
+    // A link the page's own script took, Alt with Shift, Cmd or Ctrl (a new window, a new tab),
+    // the middle button: left as they are (said, so their download stays the browser's).
+    ({ a, e } = t.click("https://x.test/go?f=b", { altKey: true }, undefined, (ev) => ev.preventDefault()));
+    await t.settle();
+    assert.equal(a.clicks, 0, `${who}: the page's script`);
+    for (const keys of [{ shiftKey: true }, { metaKey: true }, { ctrlKey: true }, { button: 1 }]) {
+      ({ a, e } = t.click("https://x.test/go?f=c", { altKey: true, ...keys }));
+      await t.settle();
+      assert.ok(!e.defaultPrevented && a.clicks === 0, `${who}: ${JSON.stringify(keys)}`);
+      assert.deepEqual(t.sent.at(-1), { type: "bypass", url: "https://x.test/go?f=c" });
+    }
+    // Without Alt nothing changes.
+    const said = t.sent.length;
+    ({ a, e } = t.click("https://x.test/f/a.zip"));
+    await t.settle();
+    assert.ok(!e.defaultPrevented && a.clicks === 0 && t.sent.length === said, `${who}: a plain click`);
   }
-  // Without Alt nothing changes.
-  ({ a, e } = t.click("https://x.test/f/a.zip"));
-  await t.settle();
-  assert.ok(!e.defaultPrevented && a.clicks === 0);
-  ok("Safari: page.js holds a click on a listed file type, never Alt or other types; #332: Alt said at the press, Firefox follows the link");
+  ok("Safari: page.js holds a click on a listed file type, never Alt or other types; #332, #1494: Alt said at the press, the link followed in every browser");
 }
 
 // #1092: what the tab played, offered when the page's look-up finds nothing (a feed, a post
@@ -4859,6 +5329,328 @@ const MP4 = (() => {
   assert.equal(named("https://www.douyin.com/?recommend=1"), null);
   assert.equal(named("https://www.douyin.com/jingxuan?modal_id=12"), null);
   ok("#1092: Douyin's posts named; what the tab played asked only after a look-up found nothing");
+}
+
+// ---- #1496: the popup's Downloads tab and the toolbar button's count ------------------------
+
+// The popup's shared pieces (popup-ui.js) in English: what a row says, which buttons it has, a
+// name cut in its middle.
+{
+  const en = JSON.parse(readText("../../extension/_locales/en/messages.json"));
+  const getMessage = (key, subs = []) => {
+    const m = en[key];
+    if (!m) return "";
+    let text = m.message;
+    for (const [name, p] of Object.entries(m.placeholders || {})) text = text.replaceAll(`$${name}$`, subs[Number(p.content.slice(1)) - 1] ?? "");
+    return text;
+  };
+  const ctx = { chrome: { i18n: { getMessage, getUILanguage: () => "en-US" } }, console: quietConsole, URL };
+  vm.runInNewContext(readText("../../extension/popup-ui.js"), ctx);
+  const MB = 2 ** 20;
+  const now = Date.UTC(2026, 10, 19, 12, 0, 0);
+  const st = (d) => JSON.parse(JSON.stringify(ctx.statusOf(d, now, "en-US")));
+  assert.deepEqual(st({ status: "Downloading", size: 48 * MB, downloaded: 12 * MB, speed: 2 * MB, left: 42 }), {
+    text: "12 MB of 48 MB · 2 MB/s · 0:42 left",
+    tone: "",
+    bar: 0.25,
+    busy: false,
+  });
+  // No size: how much came, a bar that can't measure; another MDM's row without `left`: from its speed.
+  assert.deepEqual(st({ status: "Downloading", downloaded: 5 * MB, speed: MB }), { text: "5 MB · 1 MB/s", tone: "", bar: null, busy: true });
+  assert.equal(st({ status: "Downloading", size: 10 * MB, downloaded: 4 * MB, speed: MB }).text, "4 MB of 10 MB · 1 MB/s · 0:06 left");
+  assert.equal(st({ status: "Downloading", downloaded: 0, speed: 0 }).text, "Starting...");
+  assert.equal(st({ status: "Stopped", size: 40 * MB, downloaded: 10 * MB }).text, "Paused · 25% · 10 MB of 40 MB");
+  assert.equal(st({ status: "Queued", size: 2 ** 30, downloaded: 0 }).text, "Waiting · 1 GB");
+  const done = (ago) => st({ status: "Complete", size: 48.7 * MB, downloaded: 48.7 * MB, exists: true, finished: (now - ago) / 1000 });
+  assert.deepEqual(done(10e3), { text: "48.7 MB · Done", tone: "ok" });
+  assert.deepEqual(done(2 * 3600e3), { text: "48.7 MB · 2 hours ago", tone: "" });
+  assert.equal(done(26 * 3600e3).text, "48.7 MB · yesterday");
+  assert.deepEqual(st({ status: "Complete", size: 1, exists: false }), { text: "File deleted or moved", tone: "muted" });
+  assert.deepEqual(st({ status: "Error", error: "the server refused the connection" }), { text: "Failed: the server refused the connection", tone: "bad" });
+  assert.deepEqual(st({ status: "Error" }), { text: "Failed", tone: "bad" });
+  // The buttons: this computer's file, another MDM's (nothing that needs the file here), running, gone, failed.
+  const on = (a) => Object.entries(a).filter(([, v]) => v).map(([k]) => k).sort();
+  const d = { status: "Complete", exists: true, url: "https://files.example.com/a.zip", redownload: true };
+  assert.deepEqual(on(ctx.actionsOf(d, { local: true, share: true })), ["again", "copyFile", "copyLink", "del", "folder", "open", "remove", "share"]);
+  assert.deepEqual(on(ctx.actionsOf(d, { local: true, share: false })), ["again", "copyFile", "copyLink", "del", "folder", "open", "remove"], "no share sheet (Linux)");
+  assert.deepEqual(on(ctx.actionsOf(d, { local: false, share: true })), ["copyLink", "remove"], "another MDM's: nothing that needs the file here");
+  assert.deepEqual(on(ctx.actionsOf({ ...d, status: "Downloading", redownload: false }, { local: true })), ["copyLink", "folder", "pause"]);
+  assert.deepEqual(on(ctx.actionsOf({ ...d, exists: false }, { local: true, share: true })), ["again", "copyLink", "folder", "remove"]);
+  assert.deepEqual(on(ctx.actionsOf({ ...d, status: "Error", redownload: false }, { local: false })), ["copyLink", "remove", "resume"]);
+  assert.ok(!ctx.actionsOf({ ...d, url: "javascript:alert(1)" }).copyLink, "only a web, FTP or magnet address is copied");
+  // A long name keeps its start and its extension.
+  const fits = (n) => (text) => Array.from(text).length <= n;
+  const long = "HushGram-automated-release-workflow (4).zip";
+  const cut = ctx.middleCut(long, fits(24));
+  assert.ok(Array.from(cut).length <= 24 && cut.startsWith("HushGram") && cut.endsWith("(4).zip") && cut.includes("…"), cut);
+  assert.equal(ctx.middleCut("short.zip", fits(24)), "short.zip");
+  assert.ok(ctx.middleCut("abcdefghijklmnopqrstuvwxyz", fits(10)).length <= 10);
+  // Sizes and speeds in the browser's language.
+  assert.equal(ctx.sizeText(1536, "en-US"), "1.5 kB");
+  assert.equal(ctx.speedText(3 * MB, "de"), "3 MB/s");
+  assert.equal(ctx.clockText(3725), "1:02:05");
+  assert.equal(ctx.actWhyText("missing"), "Its file is no longer where it was saved (moved or deleted).");
+  assert.equal(ctx.actWhyText("odd"), "That didn't work. Try again.");
+  ok("#1496 the popup's rows: status lines, buttons, cut names");
+}
+
+// #1613: a copy loaded by hand says so in its popup, with its browser's store; the store's copy,
+// a policy's, one another program installed (Chrome adding the store's copy from MDM's setup)
+// and "other" say nothing. popup-ui.js installNote, and popup.js showInstall as the popup runs it
+// (management.getSelf, which needs no "management" permission; none in Safari).
+{
+  const en = JSON.parse(readText("../../extension/_locales/en/messages.json"));
+  const getMessage = (key) => (en[key] ? en[key].message : "");
+  const ctx = { chrome: { i18n: { getMessage, getUILanguage: () => "en-US" } }, console: quietConsole, URL };
+  vm.runInNewContext(readText("../../extension/popup-ui.js"), ctx);
+  const AMO = "https://addons.mozilla.org/firefox/addon/mister-download-manager/";
+  const CWS = "https://chromewebstore.google.com/detail/mister-download-manager/ejoleppdfgjdndddcjoehopknmlglojp";
+  const note = (installType, firefox) => JSON.parse(JSON.stringify(ctx.installNote({ installType }, firefox)));
+  assert.deepEqual(note("development", false), {
+    text: "This copy was loaded by hand and won't update itself.",
+    link: "Add it from the Chrome Web Store",
+    href: CWS,
+  });
+  assert.deepEqual(note("development", true), {
+    text: "This copy was loaded by hand: it won't update itself, and the browser removes it when it restarts.",
+    link: "Add it from addons.mozilla.org",
+    href: AMO,
+  });
+  for (const type of ["normal", "admin", "sideload", "other", undefined]) {
+    for (const firefox of [false, true]) assert.equal(ctx.installNote({ installType: type }, firefox), null, `${type}, firefox ${firefox}`);
+  }
+  assert.equal(ctx.installNote(null, false), null, "no answer: nothing");
+  // The links are the ones the README and the website use.
+  const readme = readText("../../README.md");
+  const site = readText("../website/build.py");
+  assert.ok(readme.includes(AMO) && readme.includes(CWS), "the README's store links");
+  assert.ok(site.includes(`AMO = "${AMO}"`) && site.includes(`CWS = "${CWS}"`), "the website's store links");
+
+  // popup.js' showInstall against a fake popup: what its line shows for each browser and answer.
+  const popup = readText("../../extension/popup.js");
+  const at = popup.indexOf("async function showInstall(");
+  const body = popup.slice(at, popup.indexOf("\n}\n", at) + 2);
+  const shown = async ({ firefox, self, safari = false, management = true }) => {
+    const els = Object.fromEntries(["by-hand", "by-hand-text", "by-hand-store"].map((id) => [id, { hidden: true, textContent: "", href: "" }]));
+    const ext = {
+      runtime: { getManifest: () => (safari ? { browser_specific_settings: { safari: {} } } : {}) },
+      ...(management ? { management: { getSelf: () => (self instanceof Error ? Promise.reject(self) : Promise.resolve(self)) } } : {}),
+    };
+    const run = new Function("ext", "firefox", "$", "installNote", `${body}\nreturn showInstall();`);
+    await run(ext, firefox, (id) => els[id], ctx.installNote);
+    return els["by-hand"].hidden ? null : [els["by-hand-text"].textContent, els["by-hand-store"].textContent, els["by-hand-store"].href];
+  };
+  assert.deepEqual(await shown({ firefox: false, self: { installType: "development" } }), [en.popup_by_hand.message, en.popup_store_chrome.message, CWS]);
+  assert.deepEqual(await shown({ firefox: true, self: { installType: "development" } }), [en.popup_by_hand_firefox.message, en.popup_store_firefox.message, AMO]);
+  for (const installType of ["normal", "admin", "sideload", "other"]) {
+    assert.equal(await shown({ firefox: false, self: { installType } }), null, `Chromium ${installType}`);
+    assert.equal(await shown({ firefox: true, self: { installType } }), null, `Firefox ${installType}`);
+  }
+  // Safari (no getSelf; its extension comes only with the app), no management at all, a refusal.
+  assert.equal(await shown({ firefox: false, safari: true, self: { installType: "development" } }), null, "Safari");
+  assert.equal(await shown({ firefox: false, management: false }), null, "no management API");
+  assert.equal(await shown({ firefox: true, self: new Error("refused") }), null, "getSelf refused");
+  // No "management" permission for it, in any manifest.
+  for (const m of ["manifest.json", "manifest.firefox.json", "manifest.safari.json"]) {
+    const j = JSON.parse(readText(`../../extension/${m}`));
+    assert.ok(![...(j.permissions || []), ...(j.optional_permissions || [])].includes("management"), `${m} asks no "management" permission`);
+  }
+  ok("#1613 a copy loaded by hand says it won't update itself, with its store; the store's, a policy's or a sideloaded one says nothing");
+}
+
+// Another MDM's list cut to the popup's view as the app cuts its own (mdm_ipc RecentAnswer::of,
+// its test recent_view_filters_counts_and_limits: the same downloads, the same answers).
+{
+  const { api } = fakeApi({ firefox: false });
+  const ctx = load(api, false);
+  const row = (id, file, status) => ({ id, file, url: `https://files.example.com/${file}`, status });
+  const all = [
+    row(1, "Report final.pdf", "Complete"),
+    row(2, "report draft.docx", "Error"),
+    row(3, "holiday.mp4", "Downloading"),
+    row(4, "report-2.zip", "Downloading"),
+    row(5, "notes.txt", "Stopped"),
+    row(6, "report 3.pdf", "Complete"),
+  ];
+  const view = (filter, search, limit) => JSON.parse(JSON.stringify(ctx.recentView(all, { filter, search, limit }, 9)));
+  const ids = (v) => v.downloads.map((x) => x.id);
+  const every = view("all", "", 50);
+  assert.deepEqual(ids(every), [6, 5, 4, 3, 2, 1]);
+  assert.deepEqual(every.counts, { all: 6, running: 2, done: 2, failed: 1 });
+  assert.deepEqual([every.running, every.speed], [2, 9]);
+  const reports = view("done", "REPORT", 50);
+  assert.deepEqual(ids(reports), [6, 1]);
+  assert.deepEqual(reports.counts, { all: 4, running: 1, done: 2, failed: 1 });
+  assert.equal(reports.running, 2);
+  assert.deepEqual(ids(view("all", "report files.example", 50)), [6, 4, 2, 1]);
+  assert.deepEqual(ids(view("all", "report mp4", 50)), []);
+  assert.deepEqual(ids(view("running", "", 50)), [4, 3]);
+  assert.deepEqual(ids(view("failed", "", 50)), [2]);
+  assert.deepEqual(ids(view("paused", "", 2)), [6, 5]);
+  assert.deepEqual(ids(view("all", "", 0)), []);
+  const many = Array.from({ length: 500 }, (_, i) => row(i + 1, "a.bin", "Complete"));
+  const capped = ctx.recentView(many, { filter: "all", search: "", limit: 10000 });
+  assert.deepEqual([capped.downloads.length, capped.downloads[0].id], [200, 500]);
+  // The same cases as the app's own test.
+  const rust = readText("../../crates/ipc/src/api.rs");
+  assert.ok(rust.includes('row(4, "report-2.zip", "Downloading")') && rust.includes('ask("done", "REPORT", 50)'), "the app's test has the same cases");
+  ok("#1496 another MDM's list: the same view as the app's");
+}
+
+// A popup's port (as popup-downloads.js opens it): what it is sent, and what it can do.
+function popupPort(sender = { id: "ours", url: "chrome-extension://ours/popup.html" }) {
+  const posted = [];
+  const heard = [];
+  const ended = [];
+  return {
+    posted,
+    port: {
+      name: "recent",
+      sender,
+      onMessage: { addListener: (f) => heard.push(f) },
+      onDisconnect: { addListener: (f) => ended.push(f) },
+      postMessage: (m) => posted.push(JSON.parse(JSON.stringify(m))),
+    },
+    send: (m) => heard.forEach((f) => f(m)),
+    close: () => ended.forEach((f) => f()),
+  };
+}
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const until = async (what, ms, check) => {
+  const end = Date.now() + ms;
+  for (;;) {
+    const got = await check();
+    if (got) return got;
+    if (Date.now() > end) throw new Error(`waited for ${what}`);
+    await wait(20);
+  }
+};
+
+// This computer's MDM: one native port for the list (not a helper per question), the file type
+// icons sent once, the toolbar button's count while something runs, the buttons' messages; a
+// page's script can't ask; the port closes once nothing runs and the popup is closed.
+{
+  let running = 2;
+  const list = (m) => ({
+    downloads: m.recent.limit
+      ? [{ id: 3, file: "a.zip", url: "https://files.example.com/a.zip", path: "C:\\dl\\a.zip", status: "Complete", size: 5, downloaded: 5, speed: 0, exists: true, icon: "zip" }]
+      : [],
+    counts: { all: 1, running: 0, done: 1, failed: 0 },
+    running,
+    speed: 0,
+    icons: m.recent.have.includes("zip") ? {} : { zip: "data:image/png;base64,iVBORw0KGgo=" },
+    share: true,
+  });
+  const reply = (m) => (m.recent ? { ok: true, recent: list(m) } : m.downloadAct ? { ok: true, act: { done: true } } : { ok: true });
+  const { api, calls, listeners } = fakeApi({ firefox: false, reply, nativePort: true });
+  load(api, false);
+  await settle();
+  const badges = () => calls.filter((c) => c[0] === "badge").map((c) => c[1]);
+  const recents = () => calls.filter((c) => c[0] === "native" && c[2].recent).map((c) => c[2].recent);
+  // A download handed over: the count is watched.
+  listeners.determining({ id: 70, url: "https://x/big.zip", filename: "big.zip" }, () => {});
+  await until("the count", 3000, () => badges().includes("2"));
+  assert.equal(recents()[0].limit, 0, "the badge asks for counts only");
+  // The popup's port: the list, the icons once.
+  const p = popupPort();
+  listeners.connect(p.port);
+  p.send({ type: "ask", ask: { filter: "done", search: "a", limit: 60, px: 48 } });
+  await until("the popup's list", 3000, () => p.posted.length);
+  const first = p.posted[0];
+  assert.deepEqual([first.type, first.ok, first.remote, first.list.downloads[0].file, first.px], ["list", true, null, "a.zip", 48]);
+  assert.equal(first.icons.zip, "data:image/png;base64,iVBORw0KGgo=");
+  const asked = recents().at(-1);
+  assert.deepEqual([asked.filter, asked.search, asked.limit, asked.px], ["done", "a", 60, 48]);
+  await until("the second answer", 3000, () => p.posted.length >= 2);
+  assert.deepEqual(p.posted[1].icons, {}, "an icon is sent once");
+  assert.deepEqual(recents().at(-1).have, ["zip"], "the app is told which icons are here");
+  assert.equal(calls.filter((c) => c[0] === "port-open").length, 1, "one helper for all the questions");
+  // A page's script can't open that port.
+  const page = popupPort({ id: "ours", url: "https://evil.test/", tab: { id: 4 } });
+  listeners.connect(page.port);
+  page.send({ type: "ask", ask: { limit: 60 } });
+  // The buttons.
+  assert.deepEqual(await popupAsk(listeners, { type: "download-act", act: "folder", id: 3 }), { ok: true, why: null });
+  assert.deepEqual(calls.filter((c) => c[0] === "native" && c[2].downloadAct).map((c) => c[2].downloadAct), [{ act: "folder", id: 3 }]);
+  await wait(1100);
+  assert.equal(page.posted.length, 0, "never answered");
+  // Nothing runs any more, and the popup closes: the count goes, the helper's port closes.
+  running = 0;
+  p.close();
+  await until("the count gone", 6000, () => badges().at(-1) === "");
+  await until("the port closed", 6000, () => calls.some((c) => c[0] === "port-closed"));
+  ok("#1496 this computer's list: one port, icons once, the count, the buttons; never for a page");
+}
+
+// MDM not running, an older helper (which refuses the question), a button that can't: said so,
+// and the browser still counts as connected.
+{
+  const replies = [{ ok: false, appState: "off" }, { ok: false, why: "refused", error: "not an http(s) or ftp(s) URL" }];
+  const reply = (m) => (m.recent ? replies[0] : m.downloadAct ? { ok: false, act: { done: false, why: "missing" } } : { ok: true });
+  const { api, store, listeners } = fakeApi({ firefox: false, reply, nativePort: true });
+  load(api, false);
+  await settle();
+  const p = popupPort();
+  listeners.connect(p.port);
+  await until("the popup's word", 3000, () => p.posted.length);
+  assert.deepEqual([p.posted[0].ok, p.posted[0].appState, p.posted[0].why], [false, "off", null]);
+  replies.shift();
+  await until("an older helper's word", 3000, () => p.posted.some((x) => x.appState === "old"));
+  assert.equal(store.status && store.status.why, null, "still connected");
+  assert.deepEqual(await popupAsk(listeners, { type: "download-act", act: "copy-file", id: 3 }), { ok: false, why: "missing" });
+  p.close();
+  ok("#1496 MDM not running, an older helper, a button refused: said, still connected");
+}
+
+// Another MDM (#157): its remote control's list cut to the view, no icons, nothing that needs
+// the file here; pause, resume and remove go to its API.
+{
+  const { api, listeners } = fakeApi({ firefox: false, nativePort: true });
+  await api.storage.local.set({ remote: { url: "https://srv.test:8463/", token: "tok" }, remotes: [{ url: "https://srv.test:8463/", token: "tok" }] });
+  served["https://srv.test:8463/api/list"] = {
+    body: JSON.stringify({
+      downloads: [
+        { id: 1, file: "old.iso", url: "https://files.example.com/old.iso", path: "", status: "Complete", size: 9, downloaded: 9, speed: 0 },
+        { id: 2, file: "new.zip", url: "https://files.example.com/new.zip", path: "", status: "Downloading", size: 9, downloaded: 3, speed: 3 },
+      ],
+      speed: 3,
+    }),
+  };
+  let acted = null;
+  served["https://srv.test:8463/api/act"] = (opts) => {
+    acted = JSON.parse(opts.body);
+    return { body: JSON.stringify({ done: acted.ids, skipped: [] }) };
+  };
+  load(api, false);
+  await settle();
+  const p = popupPort();
+  listeners.connect(p.port);
+  p.send({ type: "ask", ask: { filter: "all", search: "", limit: 60, px: 24 } });
+  await until("the server's list", 3000, () => p.posted.length);
+  const got = p.posted.at(-1);
+  assert.deepEqual([got.ok, got.remote, got.list.downloads.map((d) => d.id), got.list.share], [true, "https://srv.test:8463/", [2, 1], false]);
+  const listCall = fetched.filter((f) => f[0] === "https://srv.test:8463/api/list");
+  assert.ok(listCall.length && listCall.every((f) => f[1] === "omit"), "no cookies to the server");
+  assert.deepEqual(await popupAsk(listeners, { type: "download-act", act: "pause", id: 2 }), { ok: true });
+  assert.deepEqual(acted, { action: "pause", ids: [2] });
+  assert.deepEqual(await popupAsk(listeners, { type: "download-act", act: "resume", id: 2 }), { ok: true });
+  assert.deepEqual(acted, { action: "start", ids: [2] });
+  assert.deepEqual(await popupAsk(listeners, { type: "download-act", act: "open", id: 1 }), { ok: false, why: "unsupported" });
+  assert.deepEqual(await popupAsk(listeners, { type: "download-act", act: "delete", id: 1 }), { ok: false, why: "unsupported" });
+  p.close();
+  delete served["https://srv.test:8463/api/list"];
+  delete served["https://srv.test:8463/api/act"];
+  ok("#1496 another MDM's list: its view, no icons, only what its remote control does");
+}
+
+// The permissions don't grow for the list: the popup copies a link and asks the app for the rest.
+{
+  const before = { chrome: ["downloads", "contextMenus", "nativeMessaging", "cookies", "storage", "webRequest", "scripting", "declarativeNetRequestWithHostAccess", "proxy"], firefox: ["downloads", "contextMenus", "nativeMessaging", "cookies", "storage", "webRequest", "webRequestBlocking", "scripting"] };
+  assert.deepEqual(JSON.parse(readText("../../extension/manifest.json")).permissions, before.chrome);
+  assert.deepEqual(JSON.parse(readText("../../extension/manifest.firefox.json")).permissions, before.firefox);
+  const pack = readText("./pack.ps1");
+  for (const f of ["popup-ui.js", "popup-downloads.js"]) assert.ok(pack.includes(`"${f}"`), `pack.ps1 copies ${f}`);
+  ok("#1496 no new permissions; the popup's new scripts are packed");
 }
 assert.deepEqual(complaints, [], "nothing written to the console as an error or warning");
 
