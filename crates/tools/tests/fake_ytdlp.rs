@@ -329,7 +329,7 @@ fn fake_ytdlp() -> ExitCode {
     // end. `live-ends-gate`: it waits for `go.txt` before it says so. With `-x`, the
     // recording made an MP3 (`ID3 …`) as yt-dlp's ffmpeg extracts the sound, the recording kept
     // only with `-k`. `live-split`: the picture and the sound recorded apart; `live-split-ends`:
-    // so, then the stream ends (3 s in) and yt-dlp merges them into `<stem>.mp4` as its ffmpeg
+    // so, then the stream ends (30 blocks in) and yt-dlp merges them into `<stem>.mp4` as its ffmpeg
     // does (`FAKEMP4 `, the picture's then the sound's), keeping them only with `-k`.
     // `live-late`: as ffmpeg opens its file late and writes its first block later still: after
     // `MDMQ` it waits (30 s at most) for `open.txt` in the folder, creates the `.part` empty, then
@@ -361,11 +361,15 @@ fn fake_ytdlp() -> ExitCode {
             let mut video = std::fs::File::create(format!("{v}.part")).unwrap();
             let mut audio = std::fs::File::create(format!("{a}.part")).unwrap();
             let end = Instant::now() + Duration::from_secs(60);
-            let started = Instant::now();
+            let mut blocks = 0;
             while Instant::now() < end {
                 video.write_all(&chunk).unwrap();
                 audio.write_all(&chunk[..116 * 188]).unwrap();
-                if mode == "live-split-ends" && started.elapsed() >= Duration::from_secs(3) {
+                blocks += 1;
+                // Over once 30 blocks are in (about 3 s), never by the clock: on a slow machine
+                // a few blocks would be within the second an MP4 may lose and still count as
+                // whole, and the `short` check would see the streams removed.
+                if mode == "live-split-ends" && blocks >= 30 {
                     drop((video, audio));
                     std::fs::rename(format!("{v}.part"), &v).unwrap();
                     std::fs::rename(format!("{a}.part"), &a).unwrap();

@@ -1527,19 +1527,11 @@ fn finished_live(
         .and_then(|q| q.split_whitespace().next())
         .map(|ids| ids.split('+').collect())
         .unwrap_or_default();
-    let mut streams: Vec<(PathBuf, u64)> = Vec::new();
-    if ids.len() > 1 && f.is_file() {
-        for id in &ids {
-            for e in MEDIA {
-                let s = dir.join(format!("{stem}.f{id}.{e}"));
-                if let Ok(m) = std::fs::symlink_metadata(&s)
-                    && m.is_file()
-                {
-                    streams.push((s, m.len()));
-                }
-            }
-        }
-    }
+    let streams = if ids.len() > 1 && f.is_file() {
+        merged_streams(&dir, &stem, &ids)
+    } else {
+        Vec::new()
+    };
     if !streams.is_empty() {
         let ffprobe = recorder.ffmpeg.as_deref().and_then(ffprobe_of);
         if whole(ffprobe.as_deref(), &f, &streams) {
@@ -1595,6 +1587,34 @@ fn finished_live(
         }
     }
     f
+}
+
+/// The streams a merge of the format `ids` joined, as `dir`'s own entries: each file named
+/// exactly `<stem>.f<id>.<ext>` (a media extension), with its length, in the order of `ids`. The
+/// ids come from the site through yt-dlp, which leaves `\` and `..` in them, so no name is built
+/// here to open or remove: only a file that is in the folder under that very name counts, and an
+/// id that would lead out of it names nothing.
+fn merged_streams(dir: &Path, stem: &str, ids: &[&str]) -> Vec<(PathBuf, u64)> {
+    let entries: std::collections::HashMap<std::ffi::OsString, PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| (e.file_name(), e.path()))
+        .collect();
+    let mut found: Vec<(PathBuf, u64)> = Vec::new();
+    for id in ids {
+        for e in MEDIA {
+            let name = std::ffi::OsString::from(format!("{stem}.f{id}.{e}"));
+            if let Some(path) = entries.get(&name)
+                && let Ok(m) = std::fs::symlink_metadata(path)
+                && m.is_file()
+                && !found.iter().any(|(p, _)| p == path)
+            {
+                found.push((path.clone(), m.len()));
+            }
+        }
+    }
+    found
 }
 
 /// A private file for the looked-up page (its links are signed; removed when the run ends), in
@@ -5411,6 +5431,55 @@ mod tests {
             &progress,
         );
         assert!(d.join("Talk.en.vtt").exists());
+    }
+
+    /// The streams a merge joined are the folder's own files, found by their exact names: a
+    /// format id the site made `\..\..\x`, `/../../x` or `..` (yt-dlp leaves `\` and `..` in
+    /// them) names nothing outside the folder, nor anything in it but such a file, so a live
+    /// stream's finished run never removes a file that isn't one of its streams.
+    #[test]
+    fn a_merges_streams_are_the_folders_own_files_by_their_exact_names() {
+        let top = tempfile::tempdir().unwrap();
+        let d = top.path().join("videos");
+        std::fs::create_dir(&d).unwrap();
+        // What a name built from such an id reaches: a file beside the folder, through a folder
+        // named as a stream's name starts (on Windows `..` goes up without it).
+        std::fs::create_dir(d.join("Talk.f")).unwrap();
+        let victim = top.path().join("victim.mp4");
+        std::fs::write(&victim, b"not a stream").unwrap();
+        std::fs::write(d.join("Talk.f1.webm"), vec![1u8; 600]).unwrap();
+        std::fs::write(d.join("Talk.f2.m4a"), vec![2u8; 400]).unwrap();
+        // A folder under a stream's name is no stream either.
+        std::fs::create_dir(d.join("Talk.f3.mp4")).unwrap();
+        let ids = [
+            "1",
+            "2",
+            "3",
+            "\\..\\..\\victim",
+            "/../../victim",
+            "..",
+            "1",
+        ];
+        assert_eq!(
+            merged_streams(&d, "Talk", &ids),
+            [(d.join("Talk.f1.webm"), 600), (d.join("Talk.f2.m4a"), 400)]
+        );
+        // A live stream's run that ended with those ids said: its streams go (the merged file
+        // holds them, by its size), the file beside the folder stays as it was.
+        let progress = Mutex::new(Progress::default());
+        let run = LiveRun { args: template(&d) };
+        let merged = d.join("Talk.mkv");
+        std::fs::write(&merged, vec![0u8; 2000]).unwrap();
+        finished_live(
+            &run,
+            merged.clone(),
+            Some("1+2+\\..\\..\\victim+/../../victim 1280x720"),
+            &recorder(None),
+            &progress,
+        );
+        assert!(!d.join("Talk.f1.webm").exists() && !d.join("Talk.f2.m4a").exists());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"not a stream");
+        assert!(merged.is_file() && d.join("Talk.f3.mp4").is_dir());
     }
 
     /// Whether the MP4 made of a recording holds all of it, by its size when ffprobe can't
