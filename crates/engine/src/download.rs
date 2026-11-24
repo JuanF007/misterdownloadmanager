@@ -113,6 +113,16 @@ pub struct Options {
     /// bot checks (Cloudflare, seen on a public PDF), while MDM's own passes. Set when
     /// `user_agent` is the browser's. A later 403 is left to the download.
     pub agent_fallback: Option<String>,
+    /// The download's last try at a site whose bot check refused it (`refused_as_a_program`)
+    /// and the browser-like connection too (#668): its first request once more, on MDM's own
+    /// connection, with this User-Agent instead (#1422). MDM's own name
+    /// (`agent::OWN_USER_AGENT`): SourceForge's check lets programs that say what they are
+    /// through, and refuses whatever claims to be a browser without connecting like one. The
+    /// site is then remembered for the session (`agent::own_for`): its next downloads ask this
+    /// way at once. None: no such try (the download's User-Agent is one the user chose, or a
+    /// stream's that must stay its resolver's); a User-Agent in the request's own headers is
+    /// the caller's choice too, never replaced.
+    pub own_agent: Option<String>,
     /// From the browser: the address its own download of this file ended at, its redirects
     /// followed. When the address asked for is refused before any byte (`link_refused`: a
     /// one-time link the browser already spent, a token bound to its session, a site that
@@ -196,6 +206,12 @@ pub struct Options {
     /// the engine names ([`Destination::Dir`]) whose address names nothing (a script, a bare id,
     /// `videoplayback`) is named by it ([`naming::answer_name`]).
     pub page_title: Option<String>,
+    /// From the browser (#607): the web page the download was started from, whole (its tab's
+    /// address), where the Referer is often the site's address alone. A site whose file
+    /// addresses expire and are given on that page (Rapidgator's file page, `sites::origin`) is
+    /// asked there again for a fresh one when the address stops working. Not in the resume state
+    /// (like the headers): whoever resumes gives it again.
+    pub page: Option<Url>,
     /// The most one request asks for (bytes): every request, the first one too, is a range of
     /// at most this many, the next one following on the same connection. For servers that slow
     /// a long answer down (YouTube's media servers serve 10 MB ranges at full speed and a whole
@@ -206,6 +222,10 @@ pub struct Options {
     /// flush holds every write to the file (as NTFS's does, #361, #782). None: the real disk.
     #[doc(hidden)]
     pub slow_disk: Option<crate::slowdisk::SlowDisk>,
+    /// Hand the finished download's last resume state back ([`Snapshot::kept`]) instead of only
+    /// removing its file: an archive test that finds damage downloads those parts again from it,
+    /// under the same validators (#1661, [`crate::repair`]). The state file still goes.
+    pub keep_state: bool,
 }
 
 /// A callback given the path of a file the engine created (`Options::on_file_created`).
@@ -263,6 +283,7 @@ impl Default for Options {
             user_agent: crate::agent::automatic(),
             automatic_agent: true,
             agent_fallback: None,
+            own_agent: None,
             browser_final: None,
             save_interval: Duration::from_secs(2),
             speed_limit: None,
@@ -286,8 +307,10 @@ impl Default for Options {
             expected_type: None,
             expected_size: None,
             page_title: None,
+            page: None,
             request_cap: None,
             slow_disk: None,
+            keep_state: false,
         }
     }
 }
@@ -406,6 +429,16 @@ pub enum Error {
         "the site sent a web page instead of the file (a waiting page, a captcha or a sign-in): open the link in your browser, finish there, and the download comes back to MDM"
     )]
     GotWebPage,
+    /// The server's answer is no larger than a web page (`sent` bytes) where the browser's own
+    /// download of the link was a file of `size` bytes, larger than any page (#1460): an error,
+    /// a notice or an empty answer in the file's place (a link that works once, or only in the
+    /// browser), never saved as the file.
+    #[error(
+        "the server sent only {} where the browser's file is {} (a link that works once, or only in the browser): Alt+click the link to let the browser download it",
+        disk::human(*sent),
+        disk::human(*size)
+    )]
+    NotTheFile { size: u64, sent: u64 },
     /// A full answer to a range request for the same, unchanged file: the server (or one CDN
     /// edge) didn't serve the range this time. Retried; the file did not change.
     #[error("the server did not send the requested part")]
@@ -454,10 +487,25 @@ pub enum NetKind {
 }
 
 impl Error {
+    /// The download stopped because its address no longer gives the file: it expired, or the
+    /// server answers it 401, 403, 404 or 410 (a signed link's end), or with a web page (a file
+    /// host's, #701). A fresh address for the same file (Refresh download address, the browser's
+    /// next download of it) is what helps; the interface waits for one.
+    pub fn wants_new_address(&self) -> bool {
+        matches!(self, Error::Status(s) if matches!(s.as_u16(), 401 | 403 | 404 | 410))
+            || matches!(
+                self,
+                Error::LinkExpired | Error::GotWebPage | Error::NotTheFile { .. }
+            )
+    }
+
     /// The address no longer serves this file (or refuses us): retrying won't help.
     fn link_dead(&self) -> bool {
         matches!(self, Error::Status(s) if matches!(s.as_u16(), 401 | 403 | 404 | 410 | 416))
-            || matches!(self, Error::GotWebPage | Error::LinkExpired | Error::BotCheck)
+            || matches!(
+                self,
+                Error::GotWebPage | Error::NotTheFile { .. } | Error::LinkExpired | Error::BotCheck
+            )
             // A site's refusal; a service's, unless waiting helps (#44).
             || matches!(self, Error::Refused(r) if !matches!(r, Refusal::Service { fault, .. } if fault.retry_wait().is_some()))
             // Login refused; no such file (or no permission); a name the server won't take.
@@ -852,6 +900,10 @@ pub struct Snapshot {
     /// How far `Verifying` (the bytes checked) or `Merging` has come, 0 to 1, when that is
     /// known (#736).
     pub finishing: Option<f64>,
+    /// Done, with `Options::keep_state`: its last resume state (every byte on disk, the file's
+    /// validators, its final place), for [`crate::repair::reopen`]. None when it had none (a
+    /// server without ranges).
+    pub kept: Option<Arc<ResumeState>>,
 }
 
 /// One entry of a download's event log; `seq` counts up within one `Download`.
@@ -899,6 +951,9 @@ pub struct KeptAnswer {
     /// The browser-like connection it came through, when only that one got past the site's
     /// bot check (#668): the download goes on with it.
     browser: Option<Arc<crate::browserlike::Browser>>,
+    /// The User-Agent it got through with, when only MDM's own name got past the site's bot
+    /// check (#1422): the download goes on under it.
+    own_agent: Option<String>,
     headers: HeaderMap,
     took: Duration,
     at: std::time::Instant,
@@ -952,7 +1007,13 @@ pub async fn probe_kept(
         None => (url.clone(), headers),
     };
     let seen = Arc::new(crate::server::ServerSeen::default());
-    let client = client(opts, &target, &as_get, &seen)?;
+    // #1422: MDM's own name, when the site's bot check let only it through earlier this
+    // session: asked so at once; otherwise the last try, after the browser-like connection.
+    let own = own_agent(opts, &headers).filter(|_| unlocked.is_none());
+    let remembered = own.clone().filter(|_| crate::agent::own_for(&target));
+    let as_own = remembered.clone().map(|own| speaking_own(opts, own));
+    let first_opts = as_own.as_ref().unwrap_or(opts);
+    let client = client(first_opts, &target, &as_get, &seen)?;
     let expects = expects_other_file(
         opts.expected_type.as_deref(),
         opts.expected_size,
@@ -967,13 +1028,13 @@ pub async fn probe_kept(
         target.clone(),
         headers.clone(),
         opts.post.as_ref(),
-        opts.site_agent(),
+        first_opts.site_agent(),
         expects,
         &CancellationToken::new(),
     )
     .await
     {
-        Err(e) if agent_refused(&e) && opts.agent_fallback.is_some() => {
+        Err(e) if agent_refused(&e) && first_opts.agent_fallback.is_some() => {
             let mut plain = opts.clone();
             plain.user_agent = opts.agent_fallback.clone().unwrap_or_default();
             let client = self::client(&plain, &target, &as_get, &seen)?;
@@ -991,21 +1052,47 @@ pub async fn probe_kept(
         }
         asked => (client, asked),
     };
+    let (mut client, mut own_agent) = (client, remembered);
     let (head, body, browser, headers, took) = match asked {
         Ok((resp, headers, took)) => (Head::of(&resp), Body::Http(resp), None, headers, took),
         // #668: the site refused MDM's connection as a program's (`refused_as_a_program`):
         // looked at once more the way a browser connects, its answer kept for the download
         // (which then asks no more).
         Err(e) if refused_as_a_program(&e) && unlocked.is_none() && opts.post.is_none() => {
+            if own_agent.take().is_some() {
+                // Remembered, but no longer let through: learnt again next time.
+                crate::agent::forget_own(&asked_at);
+            }
             let cancel = CancellationToken::new();
-            let (b, (head, body, headers, took)) =
-                browser_ask(opts, &asked_at, &asked_with, expects, &cancel)
-                    .await
-                    .map_err(|other| match other {
-                        Error::Cancelled | Error::Adapter(_) => other,
-                        _ => e,
-                    })?;
-            (head, body, Some(b), headers, took)
+            match browser_ask(opts, &asked_at, &asked_with, expects, &cancel).await {
+                Ok((b, (head, body, headers, took))) => (head, body, Some(b), headers, took),
+                Err(other @ (Error::Cancelled | Error::Adapter(_))) => return Err(other),
+                // #1422: refused that way too; once more under MDM's own name, the last try.
+                Err(_) => match own.filter(|_| as_own.is_none()) {
+                    Some(own) => {
+                        let o = speaking_own(opts, own.clone());
+                        client = self::client(&o, &asked_at, &as_get, &seen)?;
+                        let (resp, headers, took) = get(
+                            &client,
+                            asked_at.clone(),
+                            asked_with,
+                            None,
+                            o.site_agent(),
+                            expects,
+                            &cancel,
+                        )
+                        .await
+                        .map_err(|other| match other {
+                            Error::Cancelled | Error::Adapter(_) => other,
+                            _ => e,
+                        })?;
+                        crate::agent::remember_own(&asked_at);
+                        own_agent = Some(own);
+                        (Head::of(&resp), Body::Http(resp), None, headers, took)
+                    }
+                    None => return Err(e),
+                },
+            }
         }
         Err(e) => return Err(e),
     };
@@ -1020,6 +1107,11 @@ pub async fn probe_kept(
         StatusCode::OK => (head.len, true),
         _ => (head.len, false),
     };
+    // No larger than a page where the browser's file is larger than any (#1460): said here, before
+    // anything is saved.
+    if let Some(sent) = size {
+        not_the_file(opts.expected_size, sent)?;
+    }
     // A page where a file that never is one was expected, whatever type it came as (#701).
     let body = if from_zero
         && never_a_page(
@@ -1053,6 +1145,7 @@ pub async fn probe_kept(
         head,
         body,
         browser,
+        own_agent,
         headers,
         took,
         at: std::time::Instant::now(),
@@ -1284,6 +1377,49 @@ impl Download {
         })
     }
 
+    /// [`Download::start_with`] under a name still to be numbered (`req.dest`, a
+    /// [`Destination::Free`]), unless the download was at that name already (#1705): a resume
+    /// state at `state_file` for the same address is its own, left by a run whose caller never
+    /// got to keep the name it took (MDM killed, or crashed, before its list was saved). It is
+    /// resumed then, as [`Download::resume`] would. Numbering the name past its own part file
+    /// would start the download over as "name (1)" and leave the part behind.
+    ///
+    /// Any other state there (another address's, or one that doesn't read) is someone else's,
+    /// and the name is numbered past it as before. The disk is looked at on the download's task,
+    /// never the caller's (#743). The caller makes sure no other download of its own is at that
+    /// name: two downloads of one address would otherwise both take the one state.
+    pub fn start_or_resume_own(
+        state_file: PathBuf,
+        req: Request,
+        opts: Options,
+        kept: Option<KeptAnswer>,
+    ) -> Download {
+        Download::spawn(req.url.clone(), move |shared, cancel| {
+            let sh = shared.clone();
+            let body = async move {
+                after_clearing(req.dest.folder(), &cancel).await?;
+                after_settling(&req.dest, &cancel).await?;
+                let look = {
+                    let state_file = state_file.clone();
+                    tokio::task::spawn_blocking(move || Found::look(&state_file))
+                };
+                let found = tokio::select! {
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                    found = look => found.ok(),
+                };
+                match found {
+                    Some(Found::State(Ok(saved))) if saved.url == req.url => {
+                        sh.event("Continuing the download this name was left by");
+                        run_resume(*saved, state_file, req.headers, opts, sh, cancel).await
+                    }
+                    _ if crate::ftp::is_ftp(&req.url) => run_fresh_ftp(req, opts, sh, cancel).await,
+                    _ => run_fresh(req, opts, sh, cancel, kept).await,
+                }
+            };
+            run(body, shared)
+        })
+    }
+
     fn spawn<F, Fut>(url: Url, f: F) -> Download
     where
         F: FnOnce(Arc<Shared>, CancellationToken) -> Fut,
@@ -1315,6 +1451,7 @@ impl Download {
                 server: None,
                 at_service: None,
                 finishing: None,
+                kept: None,
             }),
             seen: Default::default(),
             planner: Mutex::new(None),
@@ -1558,6 +1695,15 @@ struct Target {
 /// After asking the original address didn't help, how long until it may be asked again.
 const REFRESH_EVERY: Duration = Duration::from_secs(120);
 
+/// The refreshes of a download's target so far (`Ctx::refresh_target`).
+#[derive(Default)]
+struct Refreshes {
+    /// When asking the origin last failed to help.
+    failed_at: Option<std::time::Instant>,
+    /// When it last gave a new target.
+    switched_at: Option<std::time::Instant>,
+}
+
 /// What every connection needs to fetch a segment.
 struct Ctx {
     /// The download's client: every connection's requests go through its pool.
@@ -1570,8 +1716,12 @@ struct Ctx {
     /// the target on (`origin_of`): asked again when the target expires.
     origin: Option<(Url, HeaderMap)>,
     /// When asking the origin last failed to help (one refresh at a time; after a failure,
-    /// none for `REFRESH_EVERY`).
-    refreshed: tokio::sync::Mutex<Option<std::time::Instant>>,
+    /// none for `REFRESH_EVERY`), and when it last gave a new target.
+    refreshed: tokio::sync::Mutex<Refreshes>,
+    /// The newest target generation a range request was answered on, plus one (0: none yet):
+    /// a target a refresh gave that was refused before answering once isn't refreshed again
+    /// at once (`refresh_target`).
+    answered: std::sync::atomic::AtomicU64,
     size: u64,
     file: Arc<File>,
     opts: Options,
@@ -1591,6 +1741,9 @@ struct Ctx {
     wait_for_ranges: bool,
     /// Signalled by every 206 answer.
     range_answered: tokio::sync::Notify,
+    /// Signalled when a download without a digest learns its version's from a validated part
+    /// (`digest_agrees`): an answer from another copy waits for it (`await_digest`, #1577).
+    digest_learned: tokio::sync::Notify,
     /// Where a POST download's redirects turned into GETs (refreshing the target).
     as_get: AsGet,
     /// The file itself is a web page; otherwise an HTML answer is a sign-in wall or an error.
@@ -1700,13 +1853,32 @@ impl Ctx {
         let Some((origin, headers)) = &self.origin else {
             return false;
         };
-        let mut failed_at = self.refreshed.lock().await;
+        let mut refreshes = self.refreshed.lock().await;
         if self.target.lock().unwrap().generation != generation {
             return true; // another connection already switched
         }
         // Signed links may live minutes while the download takes hours: refresh as often as
         // that helps, but after an unhelpful refresh wait before asking again.
-        if failed_at.is_some_and(|t| t.elapsed() < REFRESH_EVERY) {
+        if refreshes
+            .failed_at
+            .is_some_and(|t| t.elapsed() < REFRESH_EVERY)
+        {
+            return false;
+        }
+        // The target the last refresh gave, refused before it answered one range: the site
+        // gives links it then refuses (an account's limit, a link bound elsewhere). Asking its
+        // page again at once would only repeat that, connection after connection: an unhelpful
+        // refresh, waited out as one.
+        if generation > 0
+            && self.answered.load(Ordering::SeqCst) <= generation
+            && refreshes
+                .switched_at
+                .is_some_and(|t| t.elapsed() < REFRESH_EVERY)
+        {
+            self.shared.event(
+                "The fresh address was refused before it gave any of the file; not asking again for now",
+            );
+            refreshes.failed_at = Some(std::time::Instant::now());
             return false;
         }
         let Some((url, mut headers)) = refresh_final_url(
@@ -1722,10 +1894,11 @@ impl Ctx {
         )
         .await
         .filter(|(u, _)| *u != self.target.lock().unwrap().url) else {
-            *failed_at = Some(std::time::Instant::now());
+            refreshes.failed_at = Some(std::time::Instant::now());
             return false;
         };
-        *failed_at = None;
+        refreshes.failed_at = None;
+        refreshes.switched_at = Some(std::time::Instant::now());
         self.shared.event(format!(
             "The address stopped working; the original address now leads to {}",
             url.host_str().unwrap_or("?")
@@ -1755,25 +1928,34 @@ impl Ctx {
 
 /// What a download asks again for today's target when `target` stops working (`Ctx::origin`),
 /// with its headers: `given`, the address the user gave, when it led elsewhere; else the page a
-/// site gives `target` on when its file addresses expire (`sites::origin`: MediaFire's, #952),
-/// credentials kept to their host. None for a browser-like download: asked again through MDM's own
-/// connection, which the site's bot check refuses, it keeps the address it has (#668).
+/// site gives `target` on when its file addresses expire (`sites::origin`: MediaFire's, #952;
+/// Rapidgator's, one of `pages`), credentials kept to their host. None for a browser-like
+/// download: asked again through MDM's own connection, which the site's bot check refuses, it
+/// keeps the address it has (#668).
 fn origin_of(
     given: &Url,
     headers: &HeaderMap,
     target: &Url,
     browser_like: bool,
+    pages: &[Url],
 ) -> Option<(Url, HeaderMap)> {
     if browser_like {
         None
     } else if given != target {
         Some((given.clone(), headers.clone()))
     } else {
-        sites::origin(target).map(|page| {
+        sites::origin(target, pages).map(|page| {
             let headers = scoped_headers(headers, given, &page);
             (page, headers)
         })
     }
+}
+
+/// The web pages a download's file may be given on again (`sites::origin`): the browser's tab
+/// it was started from (`Options::page`), then its Referer.
+fn pages_of(opts: &Options, headers: &HeaderMap) -> Vec<Url> {
+    let referer = header_str(headers, header::REFERER).and_then(|r| Url::parse(r).ok());
+    opts.page.iter().cloned().chain(referer).collect()
 }
 
 /// How long an idle keep-alive socket is kept: shorter than most servers' keep-alive, so a
@@ -2042,6 +2224,8 @@ async fn run_fresh(
     let mut opts = opts;
     // The first request had to give up the browser's User-Agent (#372).
     let mut asked_as_mdm = false;
+    // It went under MDM's own name, the only one the site's bot check let through (#1422).
+    let mut asked_own = false;
     shared.limiter.set(opts.speed_limit);
     let (shared, cancel) = (&shared, &cancel);
     shared.conn(0, |_| {});
@@ -2073,6 +2257,11 @@ async fn run_fresh(
             );
             let _ = shared.seen.set(k.seen);
             browser = k.browser;
+            // The look got through under MDM's own name (#1422): so does the rest.
+            if let Some(own) = k.own_agent {
+                opts = speaking_own(&opts, own);
+                asked_own = true;
+            }
             (k.as_get, k.client, (k.head, k.body), k.headers, k.took)
         }
         None => {
@@ -2092,10 +2281,24 @@ async fn run_fresh(
             first_at = target.clone();
             let as_get = AsGet::default();
             let seen = shared.seen.get_or_init(Default::default).clone();
-            let as_given = opts.clone();
             // The download's own User-Agent, which the browser-like connection carries (#668),
-            // even when MDM's connection had to give it up (#372).
-            let given_agent = opts.user_agent.clone();
+            // even when MDM's connection had to give it up (#372, #1422).
+            let given_agent = (opts.user_agent.clone(), opts.automatic_agent);
+            // #1422: a site whose bot check let only MDM's own name through earlier this
+            // session is asked so at once, not refused twice more first.
+            let own = own_agent(&opts, &asked).filter(|_| unlocked.is_none());
+            if let Some(own) = own.clone().filter(|_| crate::agent::own_for(&target)) {
+                shared.event(format!(
+                    "{}: its bot check let only Mister Download Manager's own name through \
+                     earlier; asking so",
+                    target.host_str().unwrap_or("?"),
+                ));
+                opts = speaking_own(&opts, own);
+                asked_own = true;
+            }
+            // Its own name tried already: not once more after the browser-like connection.
+            let own_tried = asked_own;
+            let as_given = opts.clone();
             let ask = FirstAsk {
                 as_get: &as_get,
                 seen: &seen,
@@ -2142,14 +2345,33 @@ async fn run_fresh(
                     (as_get, client0, (head, Body::Http(resp)), headers, ttfb)
                 }
                 Err(e) if refused_as_a_program(&e) && unlocked.is_none() && opts.post.is_none() => {
-                    if asked_as_mdm {
-                        opts.user_agent = given_agent;
-                        asked_as_mdm = false;
+                    if asked_as_mdm || asked_own {
+                        (opts.user_agent, opts.automatic_agent) = given_agent;
+                        (asked_as_mdm, asked_own) = (false, false);
                     }
-                    let (b, head, body, headers, ttfb) =
-                        browser_first(&opts, &target, &asked, e, expects, shared, cancel).await?;
-                    browser = Some(b);
-                    (as_get, client0, (head, body), headers, ttfb)
+                    if own_tried {
+                        // Remembered, but no longer let through: learnt again next time.
+                        crate::agent::forget_own(&target);
+                    }
+                    match browser_first(&opts, &target, &asked, e, expects, shared, cancel).await {
+                        Ok((b, head, body, headers, ttfb)) => {
+                            browser = Some(b);
+                            (as_get, client0, (head, body), headers, ttfb)
+                        }
+                        // #1422: refused the way a browser connects too; once more under MDM's
+                        // own name, the last try.
+                        Err(refused) if refused_as_a_program(&refused) && !own_tried => {
+                            let Some(own) = own else {
+                                return Err(refused);
+                            };
+                            let (o, client1, ((resp, headers), ttfb)) =
+                                ask.as_own(&opts, own, &target, &asked, refused).await?;
+                            (opts, asked_own) = (o, true);
+                            let head = Head::of(&resp);
+                            (as_get, client1, (head, Body::Http(resp)), headers, ttfb)
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -2200,6 +2422,11 @@ async fn run_fresh(
         head.status,
         size.map_or("unknown".to_owned(), disk::human),
     ));
+    // #1460: no larger than a page where the browser's file is larger than any, however it was
+    // asked (the look's kept answer, the browser-like connection, MDM's own name).
+    if let Some(sent) = size {
+        not_the_file(opts.expected_size, sent)?;
+    }
     // Credentials stay with the host they were given for, with the cookies pages set on the way
     // (`get`); the first request's own range (`request_cap`) isn't theirs.
     let mut headers = headers;
@@ -2219,12 +2446,15 @@ async fn run_fresh(
             .then(|| crate::verify::Hash::from_headers(h))
             .flatten()
     });
-    let validators = Validators::from_response(
-        header_str(h, header::ETAG),
-        header_str(h, header::LAST_MODIFIED),
-        header_str(h, header::DATE),
-        final_url.host_str(),
-    );
+    let validators = Validators {
+        digests: digests_of(h),
+        ..Validators::from_response(
+            header_str(h, header::ETAG),
+            header_str(h, header::LAST_MODIFIED),
+            header_str(h, header::DATE),
+            final_url.host_str(),
+        )
+    };
     // The server's date for the finished file (Options::server_time): its Last-Modified as
     // sent, whether or not it is strong enough to resume by.
     let stamp = opts
@@ -2252,6 +2482,12 @@ async fn run_fresh(
         not_a_page(body, cancel).await?
     } else {
         body
+    };
+    // #1460: an answer that doesn't say its size, read as far as a page goes first where the
+    // browser's file is larger: one that ends there isn't the file.
+    let body = match size {
+        None => not_short(body, opts.expected_size, cancel).await?,
+        Some(_) => body,
     };
     // A file the engine names whose address and server leave its type unsaid: its first bytes
     // say it (#800), and still come first to the file.
@@ -2283,6 +2519,7 @@ async fn run_fresh(
         saved.checksum = checksum.clone();
         saved.final_get = opts.post.is_some() && post.is_none();
         saved.asked_as_mdm = asked_as_mdm;
+        saved.asked_as_own = asked_own;
         saved.browser_like = browser.is_some();
         let ctx = Arc::new(Ctx {
             client: client0.clone(),
@@ -2293,8 +2530,15 @@ async fn run_fresh(
                 post: post.clone(),
                 generation: 0,
             }),
-            origin: origin_of(&req.url, &req.headers, &final_url, browser.is_some()),
+            origin: origin_of(
+                &req.url,
+                &req.headers,
+                &final_url,
+                browser.is_some(),
+                &pages_of(&opts, &req.headers),
+            ),
             refreshed: Default::default(),
+            answered: Default::default(),
             size,
             file: file.clone(),
             opts: opts.clone(),
@@ -2307,6 +2551,7 @@ async fn run_fresh(
             advertised,
             wait_for_ranges,
             range_answered: Default::default(),
+            digest_learned: Default::default(),
             as_get,
             web_page_ok: expects_web_page(&dest, content_type.as_deref()),
             never_page,
@@ -2354,7 +2599,8 @@ async fn run_fresh(
         single_stream(body, &file, shared, opts.global.as_deref(), cancel).await?
     };
     verify_part(shared, &dest, checksum.as_ref()).await?;
-    finish(shared, file, &dest, size, stamp, replaces(&req.dest, &opts))
+    let replace = replaces(&req.dest, &opts);
+    finish(shared, file, &dest, size, stamp, replace, opts.keep_state)
 }
 
 /// Prepare the destination of a new download of `size` bytes (if known), named `name()` in a
@@ -2531,6 +2777,7 @@ async fn run_fresh_ftp(
             }),
             origin: None,
             refreshed: Default::default(),
+            answered: Default::default(),
             size,
             file: file.clone(),
             opts: opts.clone(),
@@ -2542,6 +2789,7 @@ async fn run_fresh_ftp(
             advertised: true,
             wait_for_ranges: false,
             range_answered: Default::default(),
+            digest_learned: Default::default(),
             as_get: AsGet::default(),
             web_page_ok: true,
             never_page: false,
@@ -2563,7 +2811,8 @@ async fn run_fresh_ftp(
         single_stream(first, &file, shared, opts.global.as_deref(), cancel).await?
     };
     verify_part(shared, &dest, opts.checksum.as_ref()).await?;
-    finish(shared, file, &dest, size, stamp, replaces(&req.dest, &opts))
+    let replace = replaces(&req.dest, &opts);
+    finish(shared, file, &dest, size, stamp, replace, opts.keep_state)
 }
 
 async fn run_resume(
@@ -2579,6 +2828,17 @@ async fn run_resume(
         && let Some(agent) = opts.agent_fallback.take()
     {
         opts.user_agent = agent;
+    }
+    // Only MDM's own name got past the site's bot check (#1422), for this download or for its
+    // site earlier this session: it goes on under it.
+    if !saved.browser_like
+        && (saved.asked_as_own || crate::agent::own_for(&saved.url))
+        && let Some(own) = own_agent(&opts, &headers)
+    {
+        shared.event(
+            "Going on under Mister Download Manager's own name, as the site's bot check asked",
+        );
+        opts = speaking_own(&opts, own);
     }
     shared.limiter.set(opts.speed_limit);
     let bad = |what: &str| Error::BadState(format!("{}: {what}", state_file.display()));
@@ -2650,7 +2910,13 @@ async fn run_resume(
         Some((url, h)) => (url.clone(), as_get.contains(&url), Some(h)),
         None => (saved.final_url.clone(), saved.final_get, None),
     };
-    let origin = origin_of(&saved.url, &headers, &url, browser.is_some());
+    let origin = origin_of(
+        &saved.url,
+        &headers,
+        &url,
+        browser.is_some(),
+        &pages_of(&opts, &headers),
+    );
     // Credentials stay with the host they were given for (the refresh's own way there scoped
     // them as it went).
     headers = refreshed_headers.unwrap_or_else(|| scoped_headers(&headers, &saved.url, &url));
@@ -2734,6 +3000,7 @@ async fn run_resume(
         }),
         origin,
         refreshed: Default::default(),
+        answered: Default::default(),
         size,
         file: file.clone(),
         opts,
@@ -2744,6 +3011,7 @@ async fn run_resume(
         ranges: AtomicU8::new(RANGES_YES),
         advertised: true,
         range_answered: Default::default(),
+        digest_learned: Default::default(),
         as_get,
         web_page_ok,
         never_page,
@@ -2756,9 +3024,10 @@ async fn run_resume(
         .then(|| ctx.validators.lock().unwrap().last_modified.clone())
         .flatten()
         .and_then(|lm| httpdate::parse_http_date(&lm).ok());
+    let keep = ctx.opts.keep_state;
     segmented(ctx, saved, None).await?;
     verify_part(&shared, &dest, checksum.as_ref()).await?;
-    finish(&shared, file, &dest, size, stamp, replace)
+    finish(&shared, file, &dest, size, stamp, replace, keep)
 }
 
 /// Follow the original address again (with its own headers, and a POST download's body) as the
@@ -2849,7 +3118,8 @@ async fn verify_part(
 }
 
 /// Flush and rename the part file to its final name. With `replace` (`Options::replace_existing`)
-/// a file at `dest` is replaced now, as the download completes.
+/// a file at `dest` is replaced now, as the download completes. With `keep`
+/// (`Options::keep_state`), its last resume state is handed back ([`Snapshot::kept`]).
 fn finish(
     shared: &Shared,
     file: Arc<File>,
@@ -2857,6 +3127,7 @@ fn finish(
     size: u64,
     stamp: Option<std::time::SystemTime>,
     replace: bool,
+    keep: bool,
 ) -> Result<Outcome, Error> {
     shared.every_byte_in();
     shared.set_state(State::Completing);
@@ -2926,8 +3197,21 @@ fn finish(
             other
         }
     };
-    // Only now is the resume state obsolete.
-    let _ = std::fs::remove_file(state_path(original));
+    // Only now is the resume state obsolete. Kept, it is the one a re-fetch of damaged parts
+    // goes on from (#1661): only a whole one, of a download not known to refuse ranges (a
+    // resume takes a server's full answer for a changed file and stops), at the file's place
+    // now.
+    let state = state_path(original);
+    if keep
+        && shared.view.lock().unwrap().resumable != Some(false)
+        && let Ok(mut s) = ResumeState::load(&state)
+        && s.size == size
+        && s.downloaded() == size
+    {
+        s.dest = dest.clone();
+        shared.view.lock().unwrap().kept = Some(Arc::new(s));
+    }
+    let _ = std::fs::remove_file(state);
     Ok(Outcome { path: dest, size })
 }
 
@@ -3207,8 +3491,8 @@ fn forced_gap(force: bool, took: Duration) -> Duration {
 fn link_refused(e: &Error) -> bool {
     matches!(e, Error::Status(s) if matches!(s.as_u16(), 401 | 403 | 404 | 410 | 412))
         // The site's page where the browser got the file (#701): its link spent, or bound to
-        // the browser's visit.
-        || matches!(e, Error::GotWebPage)
+        // the browser's visit. So is an answer far smaller than the browser's file (#1460).
+        || matches!(e, Error::GotWebPage | Error::NotTheFile { .. })
 }
 
 /// What a download's first request needs besides its address, headers and options.
@@ -3252,6 +3536,44 @@ impl FirstAsk<'_> {
             first => Ok((client0, first, false)),
         }
     }
+
+    /// #1422: the first request once more, after the site's bot check refused the download's
+    /// User-Agent and the browser-like connection too (`refused`, the error told if this fails
+    /// as well): on MDM's own connection under `own` (`Options::own_agent`), at the same address
+    /// with the same headers (cookies, Referer, range), once. With the answer, the options and
+    /// client the download goes on with; the site is remembered for the session.
+    async fn as_own(
+        &self,
+        opts: &Options,
+        own: String,
+        url: &Url,
+        headers: &HeaderMap,
+        refused: Error,
+    ) -> Result<(Options, Client, ((Response, HeaderMap), Duration)), Error> {
+        let (shared, cancel) = (self.shared, self.cancel);
+        let host = url.host_str().unwrap_or("?");
+        shared.event(format!(
+            "{host}: refused the way a browser connects too; asking once more as Mister \
+             Download Manager itself ({own})"
+        ));
+        let opts = speaking_own(opts, own);
+        let client = client(&opts, url, self.as_get, self.seen)?;
+        match first_get(&client, url, headers, &opts, self.expects, shared, cancel).await {
+            Ok(answer) => {
+                crate::agent::remember_own(url);
+                shared.event(format!(
+                    "{host}: let Mister Download Manager through under its own name; \
+                     downloading so (remembered for this session)"
+                ));
+                Ok((opts, client, answer))
+            }
+            Err(e @ (Error::Cancelled | Error::Adapter(_))) => Err(e),
+            Err(e) => {
+                shared.event(format!("{host}, asked as Mister Download Manager: {e}"));
+                Err(refused)
+            }
+        }
+    }
 }
 
 /// A plain 403, which a browser's User-Agent may have brought on (#372). A site's bot check
@@ -3266,6 +3588,23 @@ fn agent_refused(e: &Error) -> bool {
 /// (FileHippo's, #630).
 fn refused_as_a_program(e: &Error) -> bool {
     matches!(e, Error::BotCheck) || matches!(e, Error::Status(s) if s.as_u16() == 412)
+}
+
+/// The User-Agent a download may name itself with at a site whose bot check refused it
+/// (#1422, `Options::own_agent`): never in place of one the request's own headers carry (the
+/// caller's choice), nor when it is the download's already.
+fn own_agent(opts: &Options, headers: &HeaderMap) -> Option<String> {
+    opts.own_agent
+        .clone()
+        .filter(|own| *own != opts.user_agent && !headers.contains_key(header::USER_AGENT))
+}
+
+/// `opts` speaking under MDM's own name `own` (#1422): no other User-Agent is tried after it.
+fn speaking_own(opts: &Options, own: String) -> Options {
+    let mut opts = opts.clone();
+    opts.speak_as(own);
+    opts.agent_fallback = None;
+    opts
 }
 
 /// #668: the first request once more, after the site refused MDM's own connection as a
@@ -3384,8 +3723,24 @@ async fn get(
     let mut looked = false;
     // Redirects between a site's own hosts followed here (`get_policy`).
     let mut party_hops = 0;
+    // A site's form to post with the next request only (`PageSays::Form`: LuluStream's), and how
+    // many times one was: a site that answers with its form again didn't take it this time
+    // (LuluStream's "Security error", about a post in three), and it is posted once more, up to
+    // `MAX_FORM_POSTS`; those posts don't count as a page's redirects.
+    let mut form: Option<Bytes> = None;
+    let mut posts = 0;
     loop {
-        let req = build(client, url.clone(), post, &headers, site_agent);
+        let req = match form.take() {
+            Some(body) => {
+                let mut with_type = headers.clone();
+                with_type.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/x-www-form-urlencoded"),
+                );
+                build(client, url.clone(), Some(&body), &with_type, site_agent)
+            }
+            None => build(client, url.clone(), post, &headers, site_agent),
+        };
         let asked = std::time::Instant::now();
         let resp = cancellable(cancel, async { Ok(req.send().await?) }).await?;
         let took = asked.elapsed();
@@ -3479,6 +3834,23 @@ async fn get(
             }
             match sites::read_page(&from, &page) {
                 PageSays::Next(next) => (Duration::ZERO, next),
+                // Posted, its answer read as a page (the file's link, a refusal, the form again).
+                PageSays::Form { action, body } if posts < MAX_FORM_POSTS => {
+                    if posts > 0 {
+                        // The form again: posted once more, not a page's redirect.
+                        hops -= 1;
+                    }
+                    posts += 1;
+                    form = Some(Bytes::from(body));
+                    (Duration::ZERO, action)
+                }
+                // Still the form after its last post: the site didn't take it this time, said in
+                // its name where it has one (`sites::form_refused`).
+                PageSays::Form { .. } => {
+                    return Err(
+                        sites::form_refused(&from).map_or(Error::GotWebPage, Error::Refused)
+                    );
+                }
                 PageSays::Refused(r) => match sites::second_look(&from).filter(|_| !looked) {
                     Some(look) => {
                         looked = true;
@@ -3526,6 +3898,10 @@ async fn get(
 
 /// Most redirects in a row that pages make themselves (`get`).
 const MAX_PAGE_REDIRECTS: usize = 5;
+/// Most times a site's form is posted in one look (`get`, `PageSays::Form`): a site that answers
+/// with the form again now and then (LuluStream's, about a post in three) gives the file within
+/// a few; one that never takes it is a web page after these.
+const MAX_FORM_POSTS: usize = 5;
 /// How much of a web page is read to find its redirect.
 const PAGE_PEEK: usize = 256 << 10;
 /// The longest wait a page asks for before it leads on that is kept.
@@ -3716,7 +4092,52 @@ async fn first_get(
         )
     })
     .await?;
+    // #1460: an answer no larger than a page where the browser's file is larger than any, told
+    // here so the address the browser's download ended at is asked instead (#630).
+    if let Some(sent) = answer_size(resp.status(), resp.headers(), resp.content_length()) {
+        not_the_file(opts.expected_size, sent)?;
+    }
     Ok(((resp, headers), took))
+}
+
+/// The whole file's size an answer gives: a 200's length, a 206's total; None when it doesn't
+/// say (a chunked answer, a 206 of unknown total).
+fn answer_size(status: StatusCode, headers: &HeaderMap, len: Option<u64>) -> Option<u64> {
+    match status {
+        StatusCode::OK => len,
+        StatusCode::PARTIAL_CONTENT => parse_content_range(headers).ok().and_then(|(.., t)| t),
+        _ => None,
+    }
+}
+
+/// `Error::NotTheFile` when the server's answer, `sent` bytes in all, is no larger than a web
+/// page (`PAGE_PEEK`) where the browser's own download of the link announced a file of `size`
+/// bytes, larger than any page (#1460, `Options::expected_size`): an error, a notice or an empty
+/// answer in the file's place, which a type alone doesn't tell (JSON, plain text, none). Sizes
+/// that differ less are left alone: a file the server changed, a browser's estimate.
+fn not_the_file(size: Option<u64>, sent: u64) -> Result<(), Error> {
+    match size {
+        Some(size) if size > PAGE_PEEK as u64 && sent <= PAGE_PEEK as u64 => {
+            Err(Error::NotTheFile { size, sent })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// [`not_the_file`] for an answer that doesn't say its size (chunked): its first bytes, up to
+/// one more than a page has, are read (still first in the body returned); an answer that ends
+/// before is no larger than a page. Nothing is read when the browser announced no larger file.
+async fn not_short(
+    body: Body,
+    size: Option<u64>,
+    cancel: &CancellationToken,
+) -> Result<Body, Error> {
+    if size.is_none_or(|n| n <= PAGE_PEEK as u64) {
+        return Ok(body);
+    }
+    let (body, first) = peek(body, PAGE_PEEK + 1, cancel).await?;
+    not_the_file(size, first.len() as u64)?;
+    Ok(body)
 }
 
 /// `attempt` retried as `first_get` does; with its result, how long the try that got it took.
@@ -3854,6 +4275,11 @@ async fn supervise(ctx: Arc<Ctx>, first: Option<Body>) -> Result<(), Error> {
 async fn stop_connections(ctx: &Ctx, set: &mut JoinSet<Result<(), Error>>) {
     ctx.cancel.cancel();
     while set.join_next().await.is_some() {}
+    // None of them is connecting or receiving any more: a stopped download's list said
+    // "Connecting..." on every connection that was asking when it stopped (#1577).
+    for c in &mut ctx.shared.view.lock().unwrap().connections {
+        c.finish();
+    }
 }
 
 /// One connection: take an assignment, fetch it, repeat until there is nothing left to do.
@@ -3932,6 +4358,12 @@ async fn worker(ctx: Arc<Ctx>, id: WorkerId, mut first: Option<Body>) -> Result<
             Err(e) => {
                 ctx.shared.with_planner(|p| p.release(id));
                 if e.is_fatal() {
+                    // What stopped the download shows on the connection that met it, not
+                    // "Connecting..." (#1577).
+                    if !matches!(e, Error::Cancelled) {
+                        ctx.shared
+                            .conn(id, |c| c.status = ConnStatus::Failed(e.clone()));
+                    }
                     return Err(e);
                 }
                 // Shed: reconnect at once for the rest of the segment (not a failure).
@@ -3976,8 +4408,14 @@ async fn worker(ctx: Arc<Ctx>, id: WorkerId, mut first: Option<Body>) -> Result<
                         ctx.shared.conn(id, |c| c.status = ConnStatus::Connecting);
                         continue;
                     }
+                    // A site's signed link (`sites::expiring`) is expired by its dead answer too,
+                    // when no page is known to ask for a fresh one: a fresh address helps.
                     let e = match e {
-                        Error::Status(_) if ctx.origin.is_some() => Error::LinkExpired,
+                        Error::Status(_)
+                            if ctx.origin.is_some() || sites::expiring(&target.url) =>
+                        {
+                            Error::LinkExpired
+                        }
                         e => e,
                     };
                     ctx.shared
@@ -4155,13 +4593,34 @@ async fn request(ctx: &Ctx, target: &Target, from: u64, to: u64) -> Result<Body,
     if head.status.is_success() && !ctx.web_page_ok && is_web_page(&head.headers) {
         return Err(Error::GotWebPage);
     }
+    // Another copy's whole answer, with a digest, where the download has none yet to compare it
+    // with: another connection's validated part may teach it in a moment (#1577).
+    if head.status == StatusCode::OK && unproven_copy(ctx, if_range.as_ref(), &head) {
+        await_digest(ctx).await?;
+    }
     match head.status {
+        // A part of another file: its whole file's digest isn't the download's (#1577).
+        StatusCode::PARTIAL_CONTENT if !digest_agrees(ctx, if_range.is_some(), &head) => {
+            return Err(Error::FileChanged);
+        }
         StatusCode::PARTIAL_CONTENT => {
             ctx.learn_ranges(true);
             ctx.range_answered.notify_one();
         }
         // The same file under another ETag (each CDN node has its own): go on with the date.
         StatusCode::OK if per_node_etag(ctx, if_range.as_ref(), &head) => {
+            return Err(Error::RangesUnavailable);
+        }
+        // Another server's copy, after the address moved there (a file host's fresh link):
+        // its own ETag and date, the same length. Its validators are taken; the overlap check
+        // still compares the bytes on disk as each connection goes on.
+        StatusCode::OK if other_server_copy(ctx, &head) => {
+            return Err(Error::RangesUnavailable);
+        }
+        // Another copy of the file behind the same address (a CDN whose nodes fetch it from
+        // different origins, #1577): its own ETag and date, but the whole file's digest the
+        // download has. The ranges go on without `If-Range`, each answer checked by its digest.
+        StatusCode::OK if copy_by_digest(ctx, if_range.as_ref(), &head) => {
             return Err(Error::RangesUnavailable);
         }
         // A full body for a ranged request once ranges are known to work: If-Range failed (the
@@ -4175,6 +4634,14 @@ async fn request(ctx: &Ctx, target: &Target, from: u64, to: u64) -> Result<Body,
             if ctx.never_page && !ctx.web_page_ok {
                 not_a_page(body, &ctx.cancel).await?;
             }
+            return Err(Error::FileChanged);
+        }
+        // A full body before any part came (the ranges not known yet) whose whole-file digest
+        // isn't the download's: not a server without ranges but another version of the file
+        // (#1646). Taken for one, the download went on with its first connection alone and
+        // nothing said the file had changed. Without a digest on either side it can't be told
+        // from a server that ignores ranges, and goes on as one below.
+        StatusCode::OK if other_version(ctx, &head) => {
             return Err(Error::FileChanged);
         }
         StatusCode::OK if ctx.browser.is_some() => {
@@ -4197,6 +4664,8 @@ async fn request(ctx: &Ctx, target: &Target, from: u64, to: u64) -> Result<Body,
             to - 1
         )));
     }
+    ctx.answered
+        .fetch_max(target.generation + 1, Ordering::SeqCst);
     Ok(body)
 }
 
@@ -4249,6 +4718,187 @@ fn per_node_etag(ctx: &Ctx, sent: Option<&HeaderValue>, resp: &Head) -> bool {
         v.etag_host = None;
     }
     same
+}
+
+/// A full answer from a server other than the one the download's validators came from (its
+/// address moved: Rapidgator's fresh link may be on another of its servers, whose copy of the
+/// file has its own ETag and date), with the file's length and validators of its own: that
+/// server's are taken for the rest of the download, so its ranges are asked with them.
+fn other_server_copy(ctx: &Ctx, resp: &Head) -> bool {
+    let mut v = ctx.validators.lock().unwrap();
+    let host = resp.url.host_str();
+    let theirs = Validators {
+        digests: digests_of(&resp.headers),
+        ..Validators::from_response(
+            header_str(&resp.headers, header::ETAG),
+            header_str(&resp.headers, header::LAST_MODIFIED),
+            header_str(&resp.headers, header::DATE),
+            host,
+        )
+    };
+    let same = is_other_server_copy(&v, &theirs, &resp.url, resp.len == Some(ctx.size));
+    if same {
+        ctx.shared.event(format!(
+            "{} has its own copy of the file (same size): going on with its version",
+            host.unwrap_or("?")
+        ));
+        *v = theirs;
+    }
+    same
+}
+
+/// The decision of `other_server_copy`: `theirs` (the answer's validators, from `at`) is another
+/// server's copy of the file when the download's validators came from another host, the length
+/// is the file's, the answer has an ETag of its own, and both hosts are one file host's own
+/// (`sites::expiring` for the answer, `sites::same_party` between the two). Any other site's
+/// same-length answer under other validators is a file that changed on the server.
+fn is_other_server_copy(ours: &Validators, theirs: &Validators, at: &Url, same_len: bool) -> bool {
+    let host = at.host_str();
+    let Some(old) = ours.etag_host.as_deref().filter(|old| Some(*old) != host) else {
+        return false;
+    };
+    let mut was = at.clone();
+    let party =
+        sites::expiring(at) && was.set_host(Some(old)).is_ok() && sites::same_party(&was, at);
+    party && same_len && theirs.etag.is_some() && theirs != ours
+}
+
+/// A full answer to an `If-Range` the copy it came from didn't match (its own ETag or date)
+/// that still carries the whole file's digest the download has, at the file's length: another
+/// copy of the same file. From then on the download asks its ranges without `If-Range` and
+/// takes only answers that carry that digest (`digest_agrees`): a part of another version
+/// carries another digest, or none, and is never written.
+fn copy_by_digest(ctx: &Ctx, sent: Option<&HeaderValue>, resp: &Head) -> bool {
+    if !refused_if_range(ctx, sent, resp) {
+        return false;
+    }
+    let mut v = ctx.validators.lock().unwrap();
+    if v.same_digest(&digests_of(&resp.headers)) != Some(true) {
+        return false;
+    }
+    if !v.by_digest {
+        v.etag = None;
+        v.etag_host = None;
+        v.last_modified = None;
+        v.by_digest = true;
+        ctx.shared.event(format!(
+            "{} serves another copy of the file (its own ETag and date, the same content digest): going on by the digest",
+            resp.url.host_str().unwrap_or("?")
+        ));
+    }
+    true
+}
+
+/// A full answer, at the file's length, to an `If-Range` whose validator it doesn't carry: the
+/// copy it came from isn't the one the download started on (or the file changed). The same
+/// validator back means the server ignored the range (no ranges, or an edge without them).
+fn refused_if_range(ctx: &Ctx, sent: Option<&HeaderValue>, resp: &Head) -> bool {
+    let Some(sent) = sent.and_then(|s| s.to_str().ok()) else {
+        return false;
+    };
+    let h = &resp.headers;
+    let theirs = match sent.starts_with('"') {
+        true => header_str(h, header::ETAG),
+        false => header_str(h, header::LAST_MODIFIED),
+    };
+    theirs != Some(sent) && resp.len == Some(ctx.size)
+}
+
+/// A full answer that carries a whole-file digest of the same kind as the download's with
+/// another value: another version of the file, whatever the ranges turn out to be.
+fn other_version(ctx: &Ctx, resp: &Head) -> bool {
+    let v = ctx.validators.lock().unwrap();
+    v.same_digest(&digests_of(&resp.headers)) == Some(false)
+}
+
+/// How long an answer from another copy waits for the download to learn its digest.
+const DIGEST_WAIT: Duration = Duration::from_secs(10);
+
+/// [`refused_if_range`] with a digest, where the download has none yet (it started before MDM
+/// kept them, or on an answer without one): the same file or another can't be told yet.
+fn unproven_copy(ctx: &Ctx, sent: Option<&HeaderValue>, resp: &Head) -> bool {
+    let v = ctx.validators.lock().unwrap();
+    v.digests.is_empty()
+        && !v.by_digest
+        && refused_if_range(ctx, sent, resp)
+        && !digests_of(&resp.headers).is_empty()
+}
+
+/// Wait, at most [`DIGEST_WAIT`], for another connection's validated part to teach the
+/// download its digest (`digest_agrees`); then the answer is judged by it (`copy_by_digest`),
+/// and without one it is a changed file, as before.
+async fn await_digest(ctx: &Ctx) -> Result<(), Error> {
+    let learned = ctx.digest_learned.notified();
+    tokio::pin!(learned);
+    learned.as_mut().enable();
+    if !ctx.validators.lock().unwrap().digests.is_empty() {
+        return Ok(());
+    }
+    cancellable(&ctx.cancel, async {
+        let _ = tokio::time::timeout(DIGEST_WAIT, learned).await;
+        Ok(())
+    })
+    .await
+}
+
+/// Whether a part's answer may be this file's by its digest: one it carries must be the
+/// download's; once copies are told apart only by it (`by_digest`), it must carry one. A
+/// download without a digest yet (started before MDM kept them, or on a server that sent none)
+/// learns it from a part the server validated (`validated`: it was asked with `If-Range`): that
+/// part is the version on disk, so its digest is too.
+fn digest_agrees(ctx: &Ctx, validated: bool, resp: &Head) -> bool {
+    let mut v = ctx.validators.lock().unwrap();
+    let theirs = digests_of(&resp.headers);
+    match v.same_digest(&theirs) {
+        Some(same) => same,
+        None if v.by_digest => false,
+        None => {
+            if validated && v.digests.is_empty() && !theirs.is_empty() {
+                v.digests = theirs;
+                ctx.digest_learned.notify_waiters();
+            }
+            true
+        }
+    }
+}
+
+/// The whole file's digests an answer carries, the same whatever its range (`name=value`):
+/// object stores' and their CDNs' CRC-64 (Alibaba Cloud OSS, Tencent COS), the SHA-256 model
+/// hubs send for a stored file (`X-Linked-ETag`: Hugging Face's, ModelScope's), Google Cloud
+/// Storage's hashes and RFC 9530's `Repr-Digest`. Not `Content-MD5` or `Digest`, which may
+/// describe only the part sent.
+pub(crate) fn digests_of(h: &HeaderMap) -> Vec<String> {
+    let mut found = Vec::new();
+    for name in ["x-oss-hash-crc64ecma", "x-cos-hash-crc64ecma"] {
+        if let Some(v) = h.get(name).and_then(|v| v.to_str().ok()).map(str::trim)
+            && !v.is_empty()
+            && v.bytes().all(|b| b.is_ascii_digit())
+        {
+            found.push(format!("{name}={v}"));
+        }
+    }
+    if let Some(v) = h
+        .get("x-linked-etag")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().trim_matches('"').to_ascii_lowercase())
+        .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        found.push(format!("x-linked-etag={v}"));
+    }
+    for name in ["x-goog-hash", "repr-digest"] {
+        for v in h.get_all(name).iter().filter_map(|v| v.to_str().ok()) {
+            for part in v.split(',') {
+                if let Some((algo, value)) = part.trim().split_once('=') {
+                    let algo = algo.trim().to_ascii_lowercase();
+                    let value = value.trim().trim_matches(':');
+                    if !algo.is_empty() && !value.is_empty() {
+                        found.push(format!("{name}:{algo}={value}"));
+                    }
+                }
+            }
+        }
+    }
+    found
 }
 
 fn header_str(h: &HeaderMap, name: header::HeaderName) -> Option<&str> {
@@ -4756,6 +5406,89 @@ mod web_page_tests {
         // A file shorter than what is looked at.
         let short = not_a_page(answer(&[b"Rar!"]), &cancel).await.unwrap();
         assert_eq!(all(short).await, b"Rar!");
+    }
+
+    /// #1460: an answer no larger than a page where the browser's file is larger than any is
+    /// not the file; sizes that differ less, or no size from the browser, are left alone.
+    #[test]
+    fn an_answer_far_smaller_than_the_browsers_file_is_not_it() {
+        let page = PAGE_PEEK as u64;
+        // The report's: 117.65 MB announced, 4.65 KB sent.
+        let report = 123_365_000;
+        assert!(matches!(
+            not_the_file(Some(report), 4_762),
+            Err(Error::NotTheFile {
+                size: 123_365_000,
+                sent: 4_762
+            })
+        ));
+        assert!(not_the_file(Some(report), 0).is_err(), "an empty answer");
+        assert!(not_the_file(Some(page + 1), page).is_err());
+        // The file, a file a little different (changed, re-encoded), or a larger one.
+        assert!(not_the_file(Some(report), report).is_ok());
+        assert!(not_the_file(Some(report), report - (5 << 20)).is_ok());
+        assert!(not_the_file(Some(page + 1), page + 1).is_ok());
+        // A browser's file no larger than a page: a small file is a small file.
+        assert!(not_the_file(Some(page), 10).is_ok());
+        assert!(not_the_file(Some(40 << 10), 4_762).is_ok());
+        // Nothing announced (a link added by hand, Link grabber).
+        assert!(not_the_file(None, 0).is_ok());
+    }
+
+    /// #1460: the size an answer gives, by its status.
+    #[test]
+    fn an_answers_size_by_its_status() {
+        let mut h = HeaderMap::new();
+        assert_eq!(answer_size(StatusCode::OK, &h, Some(4_762)), Some(4_762));
+        assert_eq!(answer_size(StatusCode::OK, &h, None), None);
+        h.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-1023/123365000"),
+        );
+        assert_eq!(
+            answer_size(StatusCode::PARTIAL_CONTENT, &h, Some(1024)),
+            Some(123_365_000)
+        );
+        h.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-1023/*"),
+        );
+        assert_eq!(
+            answer_size(StatusCode::PARTIAL_CONTENT, &h, Some(1024)),
+            None
+        );
+        assert_eq!(answer_size(StatusCode::NO_CONTENT, &h, Some(0)), None);
+    }
+
+    /// #1460: a chunked answer that ends before a page's size, where the browser's file is
+    /// larger, is refused; a longer one comes whole, its first bytes still first; nothing is read
+    /// without a larger file announced.
+    #[tokio::test]
+    async fn a_chunked_answer_is_read_as_far_as_a_page() {
+        let cancel = CancellationToken::new();
+        let big = Some(123_365_000);
+        let json: &'static [u8] = b"{\"zt\":0,\"info\":\"link expired\"}";
+        assert!(matches!(
+            not_short(answer(&[&json[..5], &json[5..]]), big, &cancel).await,
+            Err(Error::NotTheFile { sent: 30, .. })
+        ));
+        assert!(matches!(
+            not_short(answer(&[]), big, &cancel).await,
+            Err(Error::NotTheFile { sent: 0, .. })
+        ));
+        let file: Vec<u8> = (0..(PAGE_PEEK as u32 + 5000))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let leaked: &'static [u8] = Box::leak(file.clone().into_boxed_slice());
+        let body = answer(&[&leaked[..100], &leaked[100..70_000], &leaked[70_000..]]);
+        let kept = not_short(body, big, &cancel).await.unwrap();
+        assert_eq!(all(kept).await, file);
+        let small = not_short(answer(&[json]), Some(40 << 10), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(all(small).await, json);
+        let none = not_short(answer(&[json]), None, &cancel).await.unwrap();
+        assert_eq!(all(none).await, json);
     }
 }
 
@@ -5880,5 +6613,118 @@ mod tests {
             HeaderValue::from_static("items 0-1/2"),
         );
         assert!(parse_content_range(&h).is_err());
+    }
+    /// #1577: the whole file's digests an answer carries (the same whatever its range), and
+    /// not what may describe only the part sent (`Content-MD5`) or isn't a digest.
+    #[test]
+    fn digests_of_reads_the_whole_files_digests() {
+        let sha = "6b86e41dfa4757b03e8496a95bf7cb2a3bdf00eda20f1a37b7a2ed3716ffb45a";
+        let mut h = HeaderMap::new();
+        let mut add = |name: &'static str, v: &str| {
+            h.append(name, HeaderValue::from_str(v).unwrap());
+        };
+        add("x-oss-hash-crc64ecma", "18197294942945379439");
+        add("x-cos-hash-crc64ecma", "not-a-number");
+        add("x-linked-etag", &sha.to_ascii_uppercase());
+        add(
+            "x-goog-hash",
+            "crc32c=n03x6A==, md5=Ojk9c3dhfxgoKVVHYwFbHQ==",
+        );
+        add(
+            "repr-digest",
+            "sha-256=:RK/0qy18MlBSVnWgjwz6lZEWjP/lF5HF9bvEF8FabDg=:",
+        );
+        add("content-md5", "Ojk9c3dhfxgoKVVHYwFbHQ==");
+        add(
+            "digest",
+            "SHA-256=RK/0qy18MlBSVnWgjwz6lZEWjP/lF5HF9bvEF8FabDg=",
+        );
+        assert_eq!(
+            digests_of(&h),
+            [
+                "x-oss-hash-crc64ecma=18197294942945379439".to_owned(),
+                format!("x-linked-etag={sha}"),
+                "x-goog-hash:crc32c=n03x6A==".to_owned(),
+                "x-goog-hash:md5=Ojk9c3dhfxgoKVVHYwFbHQ==".to_owned(),
+                "repr-digest:sha-256=RK/0qy18MlBSVnWgjwz6lZEWjP/lF5HF9bvEF8FabDg=".to_owned(),
+            ]
+        );
+        let mut h = HeaderMap::new();
+        h.insert("x-linked-etag", HeaderValue::from_static("\"abc\""));
+        assert!(digests_of(&h).is_empty(), "not a SHA-256");
+    }
+
+    fn copy_validators(etag: &str, host: &str, modified: &str) -> Validators {
+        Validators::from_response(
+            Some(etag),
+            Some(modified),
+            Some("Wed, 21 Oct 2015 08:00:00 GMT"),
+            Some(host),
+        )
+    }
+
+    #[test]
+    fn other_server_copy_accepts_rapidgator_node_rotation() {
+        let ours = copy_validators(
+            "\"a\"",
+            "s1.rapidgator.net",
+            "Wed, 21 Oct 2015 07:28:00 GMT",
+        );
+        let theirs = copy_validators(
+            "\"b\"",
+            "s2.rapidgator.net",
+            "Wed, 21 Oct 2015 07:28:12 GMT",
+        );
+        let at = Url::parse("https://s2.rapidgator.net/download/token").unwrap();
+        assert_ne!(ours.last_modified, theirs.last_modified);
+        assert!(is_other_server_copy(&ours, &theirs, &at, true));
+        assert!(!is_other_server_copy(&ours, &theirs, &at, false));
+        assert!(!is_other_server_copy(&theirs, &theirs, &at, true));
+        assert!(!is_other_server_copy(
+            &Validators::default(),
+            &theirs,
+            &at,
+            true
+        ));
+        for etag in [None, Some("W/\"b\""), Some("malformed")] {
+            let theirs = Validators::from_response(etag, None, None, at.host_str());
+            assert!(!is_other_server_copy(&ours, &theirs, &at, true));
+        }
+    }
+
+    #[test]
+    fn other_server_copy_rejects_generic_mirrors_and_unrelated_hosts() {
+        for (old, target) in [
+            ("dl1.example.com", "https://dl2.example.com/firmware.bin"),
+            (
+                "dl1.example.com",
+                "https://s2.rapidgator.net/download/token",
+            ),
+            ("rg.to", "https://s2.rapidgator.net/download/token"),
+            (
+                "rapidgator.net.example.com",
+                "https://s2.rapidgator.net/download/token",
+            ),
+            (
+                "s1.rapidgator.net",
+                "https://s2.rapidgator.net.example.com/download/token",
+            ),
+            (
+                "s1.rapidgator.net",
+                "https://s2.rapidgator.net/firmware.bin",
+            ),
+        ] {
+            let ours = copy_validators("\"a\"", old, "Wed, 21 Oct 2015 07:28:00 GMT");
+            let at = Url::parse(target).unwrap();
+            let theirs = copy_validators(
+                "\"b\"",
+                at.host_str().unwrap(),
+                "Wed, 21 Oct 2015 07:28:12 GMT",
+            );
+            assert!(
+                !is_other_server_copy(&ours, &theirs, &at, true),
+                "{old} -> {target}"
+            );
+        }
     }
 }

@@ -27,6 +27,10 @@ On one test machine (Windows 11, MDM 0.5.2, IDM 6.42, release builds), memory in
 
 MDM contains no adware, spyware, bundled offers or tracking. Its whole source code is public, so anyone can check what it does, and every release is built from that code by GitHub's servers, where the build can be inspected. The helper programs it can fetch for videos are verified before they run: yt-dlp against its developers' signing key, ffmpeg against its published checksums. Download MDM only from [this site](/download.html) or the project's GitHub releases.
 
+### My antivirus flags MDM. Is it a virus? {#antivirus}
+
+No, if it came from [this site](/download.html) or [GitHub Releases]({{REPO}}/releases). Some antivirus programs judge a program they don't know by an educated guess, not by a known virus: detection names such as `Malware.AI`, `Gen:`, `ML` or `Heur` mean such a guess. What they flag most is a new download few people have run yet, without a publisher's signature; MDM's installer isn't code-signed yet. To be sure your copy is ours, compare its SHA-256 checksum with the release's `SHA256SUMS.txt`. MDM is open source and every release is built in public, by GitHub Actions, so anyone can read and rebuild it. Then report the file to your antivirus as a false positive, and [tell us on GitHub]({{REPO}}/issues) so we can report it too. The commands and the antivirus makers' report pages: [My antivirus flags MDM](/help/troubleshooting.html#antivirus).
+
 ### Does MDM collect my data? {#privacy}
 
 No. MDM has no accounts, no analytics and no telemetry. It connects to the servers you download from and, each time it starts and once a day while it runs, asks GitHub whether a newer version exists (you can turn that off in Help → Check for updates). The browser extension talks only to MDM on your own computer. The details are in the [privacy policy](/privacy.html).
@@ -39,7 +43,7 @@ MDM is made by Ahmed Nefzaoui, an independent developer, and is open to contribu
 
 ### Which systems does it run on? {#systems}
 
-Windows 10 and 11 is the main platform, on 64-bit PCs (x64); from the version after 0.5.2, on Windows on ARM PCs and 32-bit Windows 10 too, each with files of its own. Builds for Linux (AppImage, .deb, .rpm and .tar.gz) and macOS (.dmg) come with every release too; today's are marked experimental. From version 0.5.0, Linux isn't experimental any more: it is checked on GNOME, KDE Plasma, Xfce and Cinnamon, in Wayland sessions too, and its packages in clean Ubuntu, Debian and Fedora systems. Still to come there: the Flatpak Firefox isn't checked yet, and screen readers (Orca) don't read MDM's windows yet. macOS stays experimental. See [Windows, Mac and Linux](/features/systems.html) and [Download](/download.html).
+Windows 10 and 11 is the main platform, on 64-bit PCs (x64); from the version after 0.5.2, on Windows on ARM PCs and 32-bit Windows 10 too, each with files of its own. Linux is supported too, with an AppImage, a .deb, an .rpm and a .tar.gz in every release: since version 0.5.0 it isn't experimental any more, and it is checked on GNOME, KDE Plasma, Xfce and Cinnamon, in Wayland sessions too, and its packages in clean Ubuntu, Debian and Fedora systems. Still to come there: the Flatpak Firefox isn't checked yet, and screen readers (Orca) don't read MDM's windows yet. macOS builds (.dmg) come with every release too, and stay experimental. See [Windows, Mac and Linux](/features/systems.html) and [Download](/download.html).
 
 ### Does it run on Windows 7 or 8? {#windows-7}
 

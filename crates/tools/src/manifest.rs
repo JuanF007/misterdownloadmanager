@@ -301,6 +301,7 @@ impl Master {
             language: None,
             direct: false,
             needs_js_runtime: false,
+            page_titled: false,
         })
     }
 }
@@ -934,6 +935,7 @@ mod tests {
                 ours,
                 Video {
                     language: None,
+                    page_titled: false,
                     ..theirs.clone()
                 },
                 "{case}"
@@ -971,7 +973,7 @@ mod tests {
         assert_eq!(v.title, "master");
         assert_eq!(v.duration, Some(20.0));
         let labels: Vec<String> = choices(&v, false).into_iter().map(|c| c.label).collect();
-        assert_eq!(labels, ["720p · H.264", "360p · H.264"]);
+        assert_eq!(labels, ["720p MP4 · H.264", "360p MP4 · H.264"]);
     }
 
     /// DRM, a live stream, a picture without its resolution, a playlist on another server, a
@@ -1412,6 +1414,7 @@ mod tests {
 
     fn browser() -> FromBrowser {
         FromBrowser {
+            private: false,
             referer: Some("https://videos.test/watch".into()),
             origin: Some("https://videos.test".into()),
             user_agent: Some("UA/1".into()),
@@ -1490,6 +1493,7 @@ mod tests {
             v,
             Video {
                 language: None,
+                page_titled: false,
                 ..theirs
             }
         );

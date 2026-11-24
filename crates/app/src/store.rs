@@ -122,6 +122,17 @@ fn load_from(p: &Path, empty: Loaded) -> Loaded {
                 // The page it came from is sent again (#795): the browser's other context
                 // (cookies, User-Agent) is memory only.
                 i.context.referer = i.referer.clone();
+                // A list an older MDM saved dropped the layout of a torrent saved straight in
+                // Save to; its address still says so. Its folder is shared, never its own.
+                if let Some(t) = &mut i.torrent {
+                    if crate::torrents::url_marks_direct(&i.url) {
+                        t.create_subfolder = false;
+                    } else if !t.create_subfolder {
+                        // Migrate folderless rows written before the durable marker existed.
+                        // An older build may drop new fields, but preserves this address.
+                        crate::torrents::mark_direct(&mut i.url);
+                    }
+                }
                 // Downloads that were running when the app closed are now stopped (resumable).
                 if i.status == Status::Downloading {
                     i.status = Status::Stopped;
@@ -251,14 +262,24 @@ fn encode(
         settings: &'a Settings,
         queues: &'a [Queue],
     }
+    // A private window's downloads live in memory only, as the browser keeps them, unless
+    // Options → General → "Keep private-window downloads in the list" is on: then they are
+    // saved like any other (their request context, cookies included, is never written: memory
+    // only for every download). Read back, a row is no longer private in memory but keeps its
+    // saved private-window mark (`Item::private_window`), which keeps it apart from normal
+    // windows' downloads; so turning the option off later leaves the rows already saved, and a
+    // private row of this session goes from the next save.
+    let keep_private = settings.keep_private_downloads;
     // The secrets as the disk keeps them: keychain references, or sealed (secrets.rs, #44).
     let settings = &settings.for_disk();
     crate::secrets::prepared(|| {
         serde_json::to_vec_pretty(&ListRef {
             version: VERSION,
             next_id,
-            // A private window's downloads live in memory only, as the browser keeps them.
-            items: items.iter().filter(|i| !i.context.private).collect(),
+            items: items
+                .iter()
+                .filter(|i| keep_private || !i.context.private)
+                .collect(),
             columns,
             settings,
             queues,
@@ -293,10 +314,42 @@ pub struct Saver {
 
 #[derive(Default)]
 struct SaverState {
-    waiting: Option<(std::path::PathBuf, Vec<u8>)>,
+    /// What to write next, and its number ([`SaverState::queued`] then).
+    waiting: Option<(std::path::PathBuf, Vec<u8>, u64)>,
     writing: bool,
     /// The last write's outcome, not yet taken.
     outcome: Option<Result<(), String>>,
+    /// How many lists were handed over; the number of the last one written, and how that went
+    /// ([`Written`]: a list handed over later is written in its place, and holds what it held).
+    queued: u64,
+    written: u64,
+    written_error: Option<String>,
+}
+
+/// The list as handed to the saver at one moment ([`Saver::last_queued`]): whether it (or a newer
+/// one, written in its place) is on the disk now. A download's files move only once the list
+/// that names their new place is saved (#1739).
+pub struct Written {
+    shared: std::sync::Arc<(std::sync::Mutex<SaverState>, std::sync::Condvar)>,
+    number: u64,
+}
+
+impl Written {
+    /// Wait until that list, or a newer one, is written: how its write went. A saver that
+    /// writes nothing for two minutes counts as failed (its thread gone, a disk that holds it).
+    pub fn wait(&self) -> Result<(), String> {
+        let (lock, cv) = &*self.shared;
+        let s = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (s, timeout) = cv
+            .wait_timeout_while(s, std::time::Duration::from_secs(120), |s| {
+                s.written < self.number
+            })
+            .unwrap_or_else(|e| e.into_inner());
+        if timeout.timed_out() && s.written < self.number {
+            return Err("the download list was not saved in time".into());
+        }
+        s.written_error.clone().map_or(Ok(()), Err)
+    }
 }
 
 impl Saver {
@@ -318,7 +371,7 @@ impl Saver {
             .spawn(move || {
                 let (lock, cv) = &*worker;
                 loop {
-                    let (p, json) = {
+                    let (p, json, number) = {
                         let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
                         while s.waiting.is_none() {
                             s = cv.wait(s).unwrap_or_else(|e| e.into_inner());
@@ -329,6 +382,8 @@ impl Saver {
                     let r = write(&p, &json).map_err(|e| e.to_string());
                     let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
                     s.writing = false;
+                    s.written = number;
+                    s.written_error = r.clone().err();
                     s.outcome = Some(r);
                     cv.notify_all();
                 }
@@ -354,8 +409,24 @@ impl Saver {
     /// Hand `json` to the saver thread, to be written as `p`.
     pub fn queue(&self, p: std::path::PathBuf, json: Vec<u8>) {
         let (lock, cv) = &*self.shared;
-        lock.lock().unwrap_or_else(|e| e.into_inner()).waiting = Some((p, json));
+        let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+        s.queued += 1;
+        s.waiting = Some((p, json, s.queued));
         cv.notify_all();
+    }
+
+    /// The list handed over last ([`Saver::save`]), to wait for on another thread.
+    pub fn last_queued(&self) -> Written {
+        let number = self
+            .shared
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .queued;
+        Written {
+            shared: self.shared.clone(),
+            number,
+        }
     }
 
     /// The outcome of the last write, once.
@@ -420,6 +491,35 @@ mod tests {
         assert!(saver.flush_until(None));
         assert_eq!(saver.outcome(), Some(Ok(())));
         assert_eq!(load_from(&p, empty()).next_id, 5);
+    }
+
+    /// #1739: a list handed over can be waited for on another thread, until it (or a newer one)
+    /// is on the disk; a write that failed says so.
+    #[test]
+    fn a_list_handed_over_can_be_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("downloads.json");
+        let layout = crate::list::ListState::default().layout();
+        let saver = Saver::new();
+        let json = encode(&p, 7, &[], &layout, &Settings::default(), &[]).unwrap();
+        saver.queue(p.clone(), json);
+        let written = saver.last_queued();
+        std::thread::spawn(move || written.wait())
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            load_from(&p, empty()).next_id,
+            7,
+            "on the disk once waited for"
+        );
+        fn refused(_: &Path, _: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::other("disk full"))
+        }
+        let failing = Saver::writing("failing saver", refused);
+        failing.queue(p.clone(), b"{}".to_vec());
+        let e = failing.last_queued().wait().unwrap_err();
+        assert!(e.contains("disk full"), "{e}");
     }
 
     /// #513: handing a file to a saver never waits for the disk (Windows held every write on C:
@@ -505,6 +605,7 @@ mod tests {
                     parts: Vec::new(),
                     named: false,
                     duration: None,
+                    part: None,
                 });
                 i
             })
@@ -535,6 +636,101 @@ mod tests {
     fn save_n(p: &Path, n: u64) {
         let layout = crate::list::ListState::default().layout();
         save_to(p, n, &[], &layout, &Settings::default(), &[]).unwrap();
+    }
+
+    /// A normal download (1) and a private window's (2), each with the browser's cookies.
+    fn normal_and_private(dir: &Path) -> Vec<Item> {
+        [(1, false), (2, true)]
+            .into_iter()
+            .map(|(id, private)| {
+                let url = url::Url::parse(&format!("https://files.example.com/f{id}.zip")).unwrap();
+                let mut i = Item::new(
+                    id,
+                    url,
+                    dir.join(format!("f{id}.zip")),
+                    crate::model::Category::Compressed,
+                );
+                i.context.private = private;
+                i.private_window = private;
+                i.context.cookies = Some(format!("sid=secret{id}"));
+                i
+            })
+            .collect()
+    }
+
+    fn saved_ids(p: &Path) -> Vec<u64> {
+        load_from(p, empty()).items.iter().map(|i| i.id).collect()
+    }
+
+    /// #1581: kept by default; unticked, a private window's downloads aren't written.
+    #[test]
+    fn a_private_windows_downloads_are_saved_by_default_and_not_when_unticked() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("downloads.json");
+        let layout = crate::list::ListState::default().layout();
+        let items = normal_and_private(dir.path());
+        let settings = Settings::default();
+        assert!(settings.keep_private_downloads, "on by default");
+        save_to(&p, 3, &items, &layout, &settings, &[]).unwrap();
+        assert_eq!(saved_ids(&p), [1, 2]);
+        // A list from before the option, or from before #1581 (its default saved), reads with
+        // it on.
+        for old in [
+            serde_json::json!({}),
+            serde_json::json!({"keep_private_downloads": false}),
+        ] {
+            let old: Settings = serde_json::from_value(old).unwrap();
+            assert!(old.keep_private_downloads);
+        }
+        let unticked = Settings {
+            keep_private_downloads: false,
+            ..Settings::default()
+        };
+        save_to(&p, 3, &items, &layout, &unticked, &[]).unwrap();
+        assert_eq!(saved_ids(&p), [1]);
+        assert!(
+            !load_from(&p, empty()).settings.keep_private_downloads,
+            "kept unticked"
+        );
+    }
+
+    #[test]
+    fn with_the_option_on_a_private_windows_downloads_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("downloads.json");
+        let layout = crate::list::ListState::default().layout();
+        let items = normal_and_private(dir.path());
+        let settings = Settings {
+            keep_private_downloads: true,
+            ..Settings::default()
+        };
+        save_to(&p, 3, &items, &layout, &settings, &[]).unwrap();
+        let loaded = load_from(&p, empty());
+        assert!(loaded.settings.keep_private_downloads, "the option is kept");
+        assert_eq!(
+            loaded.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        // The private-window mark is saved, for private rows only; the context is not.
+        assert!(loaded.items[1].private_window && !loaded.items[1].context.private);
+        assert!(!loaded.items[0].private_window);
+        let json_check = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(json_check.matches("\"private_window\"").count(), 1);
+        // Their cookies stay in memory, as every download's do.
+        let json = std::fs::read_to_string(&p).unwrap();
+        assert!(!json.contains("secret"), "{json}");
+        assert!(loaded.items.iter().all(|i| i.context.cookies.is_none()));
+        // Turning the option off later keeps the rows already saved (read back, none is
+        // marked private) ...
+        let off = Settings {
+            keep_private_downloads: false,
+            ..Settings::default()
+        };
+        save_to(&p, 3, &loaded.items, &layout, &off, &[]).unwrap();
+        assert_eq!(saved_ids(&p), [1, 2]);
+        // ... while a private row still in memory goes from the next save.
+        save_to(&p, 3, &items, &layout, &off, &[]).unwrap();
+        assert_eq!(saved_ids(&p), [1]);
     }
 
     /// Pretend `.1.bak` was written `age` ago.

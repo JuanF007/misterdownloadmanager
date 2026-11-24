@@ -66,6 +66,14 @@ impl Properties {
         std::mem::take(&mut self.files_requested)
     }
 
+    /// `item` took a new address while this window was open (the browser's next download of
+    /// its file, after Refresh download address): the window shows it, and its Referer, so OK
+    /// keeps them rather than putting back what the window opened with.
+    pub fn readdressed(&mut self, item: &Item) {
+        self.address = item.file_address().to_string();
+        self.referer = item.context.referer.clone().unwrap_or_default();
+    }
+
     /// `item` is read every frame, so status and size stay live.
     pub fn show(
         &mut self,
@@ -111,6 +119,8 @@ impl Properties {
     fn address_editable(&self, item: &Item) -> bool {
         item.status != Status::Complete
             && item.live.is_none()
+            // Its resume state is being moved (#1739): rewritten once it is at its place.
+            && item.move_from.is_none()
             && !self.stream
             && item.torrent.is_none()
     }
@@ -247,8 +257,10 @@ impl Properties {
             r(o, col, 140.0, 383.0 - col, 23.0),
             &dest.display().to_string(),
         );
-        // Moving: a finished file is moved; one that hasn't started gets a new destination.
-        let movable = !running && (complete || item.downloaded == 0);
+        // Moving: a finished file is moved; one that hasn't started gets a new destination; one
+        // stopped part-way takes its part file and resume state along (#1739).
+        let refused = item.move_refused();
+        let movable = refused.is_none();
         let pick = winui::button_light(
             ui,
             r(o, 393.0, 141.0, 73.0, 21.0),
@@ -261,18 +273,7 @@ impl Properties {
             },
             false,
         );
-        let pick = winui::why_disabled(
-            pick,
-            !movable,
-            if running {
-                // i18n: tooltip of the greyed Move button in File Properties
-                crate::i18n::mark("Pause the download first")
-            } else {
-                // i18n: tooltip of the greyed Move button in File Properties
-                crate::i18n::mark("Only a finished download, or one not started yet, can be moved")
-            },
-        )
-        .clicked();
+        let pick = winui::why_disabled(pick, !movable, refused.unwrap_or_default()).clicked();
         if pick && movable {
             let title = crate::i18n::t("Move to folder").to_owned();
             let from = item.dest.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -507,7 +508,7 @@ impl Properties {
 }
 
 /// Windows' name for the file type ("BIN File", "Compressed (zipped) Folder").
-fn file_type(name: &str, ext: &str) -> String {
+pub(crate) fn file_type(name: &str, ext: &str) -> String {
     #[cfg(windows)]
     if let Some(t) = crate::win32::type_name(name) {
         return t;
@@ -556,9 +557,11 @@ mod tests {
     fn a_torrents_properties_close_with_ok() {
         let mut torrent = item("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567");
         torrent.torrent = Some(crate::torrents::TorrentSpec {
+            ownership: None,
             hash: "0123456789abcdef0123456789abcdef01234567".into(),
             files: None,
             folder: PathBuf::from("f"),
+            create_subfolder: true,
             uploaded: 0,
             seeded_secs: 0,
             peers: 0,
